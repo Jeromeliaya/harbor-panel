@@ -1,0 +1,13 @@
+**
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!server.py
+!files.py
+!host.py
+!LICENSE
+!web/
+!web/index.html
+!web/app.js
+!web/style.css
+!web/favicon.svg

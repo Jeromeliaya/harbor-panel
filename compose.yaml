@@ -1,0 +1,28 @@
+name: harbor-panel
+
+services:
+  panel:
+    build: .
+    image: harbor-panel:local
+    init: true
+    network_mode: host
+    environment:
+      HARBOR_PASSWORD: ${HARBOR_PASSWORD:-}
+    volumes:
+      - workspace:/data/workspace
+      - state:/data/state
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  workspace:
+  state:

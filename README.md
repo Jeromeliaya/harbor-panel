@@ -60,9 +60,59 @@ export HARBOR_PASSWORD='replace-with-a-long-unique-password'
 
 密码至少 12 字符。示例密码必须替换；服务不保存明文密码。临时生成的密码仅输出到启动终端，避免将启动输出公开分享。
 
+## Docker Compose 部署
+
+此方案面向 **Linux Docker Engine + Docker Compose V2**，本地构建镜像，无需在宿主机安装 Python。Docker Desktop 需使用 Linux 容器，并先启用 host 网络支持（要求 4.34 或以上）；监控视图对应其 Linux 运行环境。
+
+克隆仓库后，在含 `compose.yaml` 的项目目录执行：
+
+```sh
+docker compose up -d --build
+docker compose logs --tail=30 panel
+```
+
+打开 `http://127.0.0.1:8088`，使用日志中显示的临时密码登录。密码未设置时每次启动都会重新生成。可选固定密码：将 `.env.example` 复制为 `.env`，把 `HARBOR_PASSWORD=` 后的值改为至少 12 字符的独立强密码，再执行 `docker compose up -d` 重建容器。`.env` 不会提交到 Git，也不会进入镜像；不要公开分享日志或包含密码的 Compose 配置输出。
+
+服务使用 host 网络并仅监听 `127.0.0.1:8088`，不需要配置 `ports`；确保该端口未被其他程序占用。远程 Linux 服务器可通过 SSH 隧道访问：
+
+```sh
+ssh -L 8088:127.0.0.1:8088 user@your-server
+```
+
+如需 HTTPS 域名访问，在 `compose.yaml` 的 `panel` 服务中增加以下 `command`，替换为实际域名，再按下方 Nginx 示例配置宿主机反向代理：
+
+```yaml
+command: ["python", "server.py", "--root", "/data/workspace", "--state-dir", "/data/state", "--public-origin", "https://panel.example.com"]
+```
+
+修改后执行 `docker compose up -d`。使用域名模式后只能通过指定的 HTTPS 地址登录，HTTP 入口不再接受登录请求。容器健康检查仅探测本机监听端口，不代替登录或业务检查。
+
+### 数据与日常操作
+
+- `workspace` 数据卷挂载到 `/data/workspace`，保存面板管理的文件；默认不能浏览宿主机其他目录。
+- `state` 数据卷挂载到 `/data/state`，保存 SQLite 审计记录；容器重建后记录保留，登录会话失效。
+- 镜像以 UID/GID `10001:10001` 的普通用户运行，应用目录只读。若改用宿主机目录挂载，需要提前为该用户准备可写目录。
+- 构建上下文使用白名单，只包含应用源码、依赖清单与静态资源，不包含运行目录、密码文件或缓存。
+
+```sh
+docker compose ps
+docker compose logs -f --tail=50 panel
+docker compose restart panel
+docker compose up -d --build
+docker compose down
+```
+
+依次用于查看状态、跟踪日志、重启、更新本地源码后重新构建、停止服务。`down` 默认保留数据卷；附加 `-v` 会删除文件和审计数据，只有确定要清空数据时才使用。
+
+### 容器模式的功能范围
+
+监控和诊断读取的是容器可见的数据：进程列表属于容器，网络视图受 host 网络影响，CPU、内存和开机时间可能来自宿主内核，不保证与容器配额一致。此方式不提供完整宿主机隔离监控；需要宿主机运维视图时使用下方原生部署。
+
+默认镜像不安装 Docker CLI，也不挂载 Docker socket，因此面板中的 Docker 工作区会明确显示不可用。需要管理宿主机容器时建议使用原生部署；仅添加 socket 挂载不能补齐 CLI，且会授予接近主机管理员的权限。
+
 ## Linux 部署
 
-推荐原生部署，使监控和文件视图对应真实宿主机。容器化运行时这些指标会对应容器环境，因此此版本不提供容易混淆宿主机权限的 Docker 部署脚本。
+需要直接监控和管理宿主机时，推荐使用以下原生部署方式。
 
 1. 将此目录放到 `/opt/harbor-panel` 并安装虚拟环境依赖。
 2. 创建专用普通用户 `harbor`、其可读写的 `/srv/harbor-workspace` 与 `/var/lib/harbor-panel`。
@@ -114,6 +164,9 @@ harbor-panel/
   web/            原创中文管理界面，无构建步骤
   tests/          标准库 unittest 测试
   deploy/         Linux systemd 示例
+  Dockerfile      非 root 容器镜像
+  compose.yaml    Compose 启动与持久化配置
+  .env.example    可选固定密码配置模板
   requirements.txt
 ```
 
