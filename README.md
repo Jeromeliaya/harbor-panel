@@ -2,7 +2,7 @@
 
 从零编写的轻量单机运维面板。采用 **Python + 原生 JavaScript/CSS**，无需 Node 构建工具，只有一个 Python 依赖 `psutil`。可在 Windows 本地运行，也可原生部署在 Linux 上。
 
-这是受 KPanel 产品方向启发的独立实现，使用原创代码、界面与品牌，不依赖或包含 KPanel 源码、Logo、脚本或资源。不代表已实现 KPanel 的全部功能。
+本项目使用原创代码、界面与品牌，提供轻量的单机运维管理功能。
 
 ## 已实现
 
@@ -119,4 +119,4 @@ harbor-panel/
 
 ## 许可
 
-本项目遵循所在仓库的 MIT 许可，见本目录 `LICENSE`。与 KPanel 项目不存在从属或官方合作关系。
+本项目采用 MIT 许可，详见本目录 `LICENSE`。
