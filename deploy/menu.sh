@@ -17,7 +17,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "请使用 root 运行，或执行: curl -fsSL URL | sudo sh" >&2
+    echo "请使用 root 运行。直接下载运行时可执行: curl -fsSL URL -o /tmp/harbor-panel-menu.sh && sudo sh /tmp/harbor-panel-menu.sh" >&2
     exit 1
 fi
 
