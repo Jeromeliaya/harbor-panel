@@ -124,6 +124,14 @@ docker compose down
 | Alpine Linux | `apk` | OpenRC |
 | CentOS / Rocky / AlmaLinux / RHEL / Fedora | `dnf` 或 `yum` | 通常为 systemd |
 
+也可以直接通过 `curl` 打开交互式管理菜单。菜单提供安装、更新、卸载和退出；源码从本仓库下载，更新不会删除工作区、审计数据库或密码配置：
+
+```sh
+sudo sh -c "\$(curl -fsSL https://raw.githubusercontent.com/Jeromeliaya/harbor-panel/main/deploy/menu.sh)"
+```
+
+菜单选项：`1` 安装、`2` 更新、`3` 卸载、`0` 退出。卸载需要输入 `UNINSTALL` 确认，只删除程序文件和服务配置，保留 `/srv/harbor-workspace`、`/var/lib/harbor-panel` 与 `/etc/harbor-panel.env`。如服务器没有 `curl`，可使用 `wget` 替代下载菜单脚本。
+
 源码默认放在 `/opt/harbor-panel` 时，在项目目录执行：
 
 ```sh
@@ -192,6 +200,7 @@ harbor-panel/
   deploy/         Linux systemd 示例
   deploy/install.sh       Debian/Ubuntu/Alpine/CentOS 安装脚本
   deploy/harbor-panel.openrc  Alpine OpenRC 服务示例
+  deploy/menu.sh          curl 交互式安装/更新/卸载菜单
   Dockerfile      非 root 容器镜像
   compose.yaml    Compose 启动与持久化配置
   .env.example    可选固定密码配置模板
