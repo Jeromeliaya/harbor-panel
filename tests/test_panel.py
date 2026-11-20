@@ -93,6 +93,8 @@ class HTTPTests(unittest.TestCase):
         cls.directory = tempfile.TemporaryDirectory()
         root = Path(cls.directory.name)
         cls.server = PanelServer(("127.0.0.1", 0), "test-password-long-enough", root / "files", root / "state")
+        cls.server.auth.username = "administrator"
+        cls.server.auth.password_hash = cls.server.auth.legacy_password_hash
         cls.port = cls.server.server_address[1]
         cls.origin = f"http://127.0.0.1:{cls.port}"
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -136,7 +138,7 @@ class HTTPTests(unittest.TestCase):
             connection.close()
 
     def login(self):
-        status, data, headers = self.request("POST", "/api/login", {"password": "test-password-long-enough"})
+        status, data, headers = self.request("POST", "/api/login", {"username": "administrator", "password": "test-password-long-enough"})
         self.assertEqual(status, 200)
         self.cookie = headers["Set-Cookie"].split(";", 1)[0]
         self.csrf = data["csrf"]
@@ -168,11 +170,11 @@ class HTTPTests(unittest.TestCase):
 
     def test_brute_force_rate_limit(self):
         for _ in range(5):
-            self.assertEqual(self.request("POST", "/api/login", {"password": "wrong"})[0], 401)
-        self.assertEqual(self.request("POST", "/api/login", {"password": "wrong"})[0], 429)
+            self.assertEqual(self.request("POST", "/api/login", {"username": "administrator", "password": "wrong"})[0], 401)
+        self.assertEqual(self.request("POST", "/api/login", {"username": "administrator", "password": "wrong"})[0], 429)
 
     def test_origin_host_and_csrf_are_required(self):
-        self.assertEqual(self.request("POST", "/api/login", {"password": "wrong"}, {"Origin": "https://other.example"})[0], 403)
+        self.assertEqual(self.request("POST", "/api/login", {"username": "administrator", "password": "wrong"}, {"Origin": "https://other.example"})[0], 403)
         self.assertEqual(self.request("GET", "/", headers={"Host": "attacker.example"})[0], 403)
         self.assertEqual(self.request("GET", "/", headers={"Sec-Fetch-Site": "cross-site"})[0], 403)
         self.assertEqual(self.request("GET", "/", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"})[0], 200)
@@ -256,6 +258,33 @@ class HTTPTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_registration_consumes_token_and_persists_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token_file = root / "bootstrap.token"
+            token_file.write_text("Zmlyc3QtdXNlLXRva2Vu", encoding="ascii")
+            server = PanelServer(("127.0.0.1", 0), None, root / "files", root / "state", bootstrap_token_file=token_file)
+            try:
+                auth = server.auth
+                self.assertTrue(auth.setup_required())
+                with self.assertRaises(PanelError):
+                    auth.register("wrong", "admin", "long-enough-password", "long-enough-password", "127.0.0.1")
+                with self.assertRaises(PanelError):
+                    auth.register("Zmlyc3QtdXNlLXRva2Vu", "admin", "long-enough-password", "different-password", "127.0.0.1")
+                auth.register("Zmlyc3QtdXNlLXRva2Vu", "admin", "long-enough-password", "long-enough-password", "127.0.0.1")
+                self.assertFalse(auth.setup_required())
+                self.assertFalse(token_file.exists())
+                with self.assertRaises(PanelError):
+                    auth.register("Zmlyc3QtdXNlLXRva2Vu", "admin", "long-enough-password", "long-enough-password", "127.0.0.1")
+                restarted = Auth(state_dir=root / "state")
+                self.assertEqual(restarted.username, "admin")
+                restarted.login("admin", "long-enough-password", "127.0.0.1")
+                with self.assertRaises(PanelError):
+                    restarted.login("other", "long-enough-password", "127.0.0.1")
+            finally:
+                server.host.close()
+                server.server_close()
+
     def test_short_password_rejected(self):
         with self.assertRaises(ValueError):
             Auth("short")

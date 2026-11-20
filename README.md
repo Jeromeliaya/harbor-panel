@@ -38,27 +38,25 @@ python3 -m venv .venv
 .venv/bin/python server.py
 ```
 
-打开终端显示的 `http://127.0.0.1:8088`，用终端输出的临时密码登录。未配置固定密码时，每次启动生成新密码；所有浏览器会话在服务重启时失效。
+首次启动需要使用一次性 Base64 凭证注册管理员用户名和密码，并再次输入密码确认。注册后凭证立即失效，账户保存在状态目录中，服务重启后仍可使用；浏览器会话在服务重启时失效。
 
 默认只监听回环地址。默认文件管理目录为项目下的 `workspace/`，审计数据库位于 `.state/`；二者均已忽略，不会作为项目源码提交。可以直接将整个 `harbor-panel` 目录复制到其他位置独立运行。
 
-### 固定密码与自定义目录
+### 自定义目录
 
 PowerShell：
 
 ```powershell
-$env:HARBOR_PASSWORD = 'replace-with-a-long-unique-password'
 .\.venv\Scripts\python.exe server.py --port 8088 --root 'D:\ServerFiles'
 ```
 
 Linux：
 
 ```sh
-export HARBOR_PASSWORD='replace-with-a-long-unique-password'
 .venv/bin/python server.py --root /srv/harbor-workspace --state-dir /var/lib/harbor-panel
 ```
 
-密码至少 12 字符。示例密码必须替换；服务不保存明文密码。临时生成的密码仅输出到启动终端，避免将启动输出公开分享。
+直接启动（非安装器）时，首次启动会在状态目录自动创建权限受限的 `bootstrap.token`，但不会打印凭证；请从该文件安全取出凭证。使用 Linux 管理菜单时，安装成功后会输出一次性凭证。
 
 ## Docker Compose 部署
 
@@ -71,7 +69,7 @@ docker compose up -d --build
 docker compose logs --tail=30 panel
 ```
 
-打开 `http://127.0.0.1:8088`，使用日志中显示的临时密码登录。密码未设置时每次启动都会重新生成。可选固定密码：将 `.env.example` 复制为 `.env`，把 `HARBOR_PASSWORD=` 后的值改为至少 12 字符的独立强密码，再执行 `docker compose up -d` 重建容器。`.env` 不会提交到 Git，也不会进入镜像；不要公开分享日志或包含密码的 Compose 配置输出。
+首次启动时，容器会在持久化状态卷中生成随机 Base64 凭证并将其输出到容器日志一次。查看 `docker compose logs panel` 并安全保存凭证；注册后凭证文件会删除。此凭证只能使用一次。
 
 服务使用 host 网络并仅监听 `127.0.0.1:8088`，不需要配置 `ports`；确保该端口未被其他程序占用。远程 Linux 服务器可通过 SSH 隧道访问：
 
@@ -144,15 +142,15 @@ sudo sh deploy/install.sh
 sudo HARBOR_PANEL_DIR=/srv/harbor-panel sh deploy/install.sh
 ```
 
-脚本会安装 Python、pip、虚拟环境组件和 `psutil` 所需的构建依赖，创建普通用户 `harbor`，并生成权限为 `0600` 的 `/etc/harbor-panel.env`。启动前必须编辑该文件设置至少 12 字符的 `HARBOR_PASSWORD`。
+脚本会安装 Python、pip、虚拟环境组件和 `psutil` 所需的构建依赖，创建普通用户 `harbor`。交互式管理菜单会生成权限为 `0600` 的一次性注册凭证文件，并在安装完成后只输出一次；请立即安全保存。
 
 Debian/Ubuntu、CentOS/RHEL/Fedora 使用 `deploy/harbor-panel.service`；Alpine 使用 `deploy/harbor-panel.openrc`。脚本最后会打印当前系统对应的启用命令。若自定义了 `HARBOR_PANEL_DIR`、`HARBOR_PANEL_WORKSPACE` 或 `HARBOR_PANEL_STATE`，请同步修改服务模板中的路径。
 
 1. 将此目录放到 `/opt/harbor-panel` 并安装虚拟环境依赖。
 2. 创建专用普通用户 `harbor`、其可读写的 `/srv/harbor-workspace` 与 `/var/lib/harbor-panel`。
-3. 创建 `/etc/harbor-panel.env`，写入 `HARBOR_PASSWORD=你的强密码`，权限设置为 `0600`，由 root 所有。
+3. 使用菜单安装以生成并展示一次性 Base64 凭证；手动部署请将随机凭证保存在状态目录中的 `bootstrap.token`（权限 `0600`），并在启动命令加入 `--bootstrap-token-file /var/lib/harbor-panel/bootstrap.token`。
 4. 将对应的 systemd 或 OpenRC 服务模板复制到系统服务目录，确认文件路径和账户正确，再启用服务。
-5. 本地使用 SSH 隧道：`ssh -L 8088:127.0.0.1:8088 user@your-server`，然后访问本机 `http://127.0.0.1:8088`。
+5. 本地使用 SSH 隧道：`ssh -L 8088:127.0.0.1:8088 user@your-server`，然后访问本机 `http://127.0.0.1:8088` 并完成首次注册。
 
 如需使用域名，在 HTTPS 反向代理后运行，并在 service 的 `ExecStart` 末尾添加 `--public-origin https://panel.example.com`。外部 Origin 必须精确匹配协议、主机及非默认端口；该模式设置 Secure Cookie，必须使用 HTTPS 浏览器入口。反向代理要保留 Host，例如已有 TLS Nginx server 内配置：
 

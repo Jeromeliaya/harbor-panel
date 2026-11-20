@@ -62,7 +62,25 @@ function showLogin() {
   $("app").hidden = true;
   $("boot").hidden = true;
   $("login").hidden = false;
+  refreshAuthForm().catch((error) => { $("login-error").textContent = error.message; });
   document.querySelectorAll("dialog[open]").forEach((dialog) => dialog.close());
+}
+
+async function refreshAuthForm() {
+  const setup = await api("setup", { login: true });
+  $("registration-fields").hidden = !setup.required;
+  $("login-fields").hidden = setup.required;
+  $("auth-title").textContent = setup.required ? "创建管理员账户" : "登录你的工作台";
+  $("auth-description").textContent = setup.required ? "使用安装时提供的一次性凭证完成首次注册。" : "使用管理员账户登录。";
+  $("auth-submit").innerHTML = setup.required ? '创建账户 <span aria-hidden="true">↗</span>' : '进入工作台 <span aria-hidden="true">↗</span>';
+  $("login-hint").textContent = setup.required ? "凭证仅可使用一次，注册后立即失效。" : "首次运行请先完成管理员注册。";
+  $("password").required = !setup.required;
+  $("username").required = !setup.required;
+  $("credential").required = setup.required;
+  $("new-username").required = setup.required;
+  $("new-password").required = setup.required;
+  $("confirm-password").required = setup.required;
+  $("login-form").dataset.setup = String(setup.required);
 }
 
 async function api(path, options = {}) {
@@ -336,7 +354,7 @@ function renderAudit() {
 
 function renderInfo() {
   const m = state.metrics;
-  $("view").innerHTML = `<div class="info-grid"><section class="panel"><h2>当前主机</h2><dl class="host-details">${detail("主机名称", m.hostname, true)}${detail("系统", `${m.platform} ${m.release}`)}${detail("处理器", m.cpu_name)}${detail("架构 / 核心", `${m.architecture} / ${m.cpu_count}`)}${detail("物理内存", bytes(m.memory.total))}${detail("系统负载", m.load ? m.load.map((value) => value.toFixed(2)).join(" / ") : "此平台不提供 load average")}${detail("累计接收 / 发送", `${bytes(m.network.received_total)} / ${bytes(m.network.sent_total)}`)}</dl></section><section class="panel"><h2>工作台配置</h2><dl class="host-details">${detail("版本", `Harbor Panel ${state.session.version}`)}${detail("管理模式", "单主机 · 单管理员")}${detail("文件根目录", state.session.file_root, true)}${detail("会话有效期", "8 小时，服务重启后失效")}${detail("监控采样", "2 秒 / 内存保留 90 个点")}${detail("文件编辑", "UTF-8 / 256 KiB / 版本检查")}${detail("会话与请求保护", "HttpOnly Cookie / SameSite / CSRF")}</dl></section><section class="panel info-wide"><h2>从这里继续扩展</h2><p>这是独立实现的核心运维版本，所有已显示指标来自当前运行主机。Docker 需要本机安装 CLI 并能够访问对应 daemon；面板进程只能使用其操作系统账户已有的权限。</p><ul><li>当前支持：监控、进程查看、目录浏览、UTF-8 文件创建/编辑/上传、文件下载、容器启停/重启/日志、诊断与审计。</li><li>尚未实现：远程节点、网站与证书管理、应用市场、交互式 SSH / PTY、AI 助手和桌面窗口系统。</li><li>部署时通过 HARBOR_PASSWORD 设置密码，通过 --root 指定文件目录。外部访问应配置 HTTPS 反向代理和 --public-origin。</li></ul><p>完整启动、测试与 Linux systemd 部署说明见项目目录中的 README.md。</p></section></div>`;
+  $("view").innerHTML = `<div class="info-grid"><section class="panel"><h2>当前主机</h2><dl class="host-details">${detail("主机名称", m.hostname, true)}${detail("系统", `${m.platform} ${m.release}`)}${detail("处理器", m.cpu_name)}${detail("架构 / 核心", `${m.architecture} / ${m.cpu_count}`)}${detail("物理内存", bytes(m.memory.total))}${detail("系统负载", m.load ? m.load.map((value) => value.toFixed(2)).join(" / ") : "此平台不提供 load average")}${detail("累计接收 / 发送", `${bytes(m.network.received_total)} / ${bytes(m.network.sent_total)}`)}</dl></section><section class="panel"><h2>工作台配置</h2><dl class="host-details">${detail("版本", `Harbor Panel ${state.session.version}`)}${detail("管理模式", "单主机 · 单管理员")}${detail("文件根目录", state.session.file_root, true)}${detail("会话有效期", "8 小时，服务重启后失效")}${detail("监控采样", "2 秒 / 内存保留 90 个点")}${detail("文件编辑", "UTF-8 / 256 KiB / 版本检查")}${detail("会话与请求保护", "HttpOnly Cookie / SameSite / CSRF")}</dl></section><section class="panel info-wide"><h2>从这里继续扩展</h2><p>这是独立实现的核心运维版本，所有已显示指标来自当前运行主机。Docker 需要本机安装 CLI 并能够访问对应 daemon；面板进程只能使用其操作系统账户已有的权限。</p><ul><li>当前支持：监控、进程查看、目录浏览、UTF-8 文件创建/编辑/上传、文件下载、容器启停/重启/日志、诊断与审计。</li><li>尚未实现：远程节点、网站与证书管理、应用市场、交互式 SSH / PTY、AI 助手和桌面窗口系统。</li><li>首次运行需使用一次性凭证注册管理员账户；部署时可通过 --root 指定文件目录。外部访问应配置 HTTPS 反向代理和 --public-origin。</li></ul><p>完整启动、测试与 Linux systemd 部署说明见项目目录中的 README.md。</p></section></div>`;
 }
 
 function searchViews() {
@@ -390,7 +408,13 @@ $("login-form").addEventListener("submit", async (event) => {
   button.disabled = true;
   $("login-error").textContent = "";
   try {
-    await api("login", { method: "POST", login: true, body: { password: $("password").value } });
+    const setup = event.currentTarget.dataset.setup === "true";
+    const body = setup
+      ? { credential: $("credential").value, username: $("new-username").value, password: $("new-password").value, confirmation: $("confirm-password").value }
+      : { username: $("username").value, password: $("password").value };
+    if (setup && body.password !== body.confirmation) throw new Error("两次输入的密码不一致。");
+    await api(setup ? "register" : "login", { method: "POST", login: true, body });
+    ["credential", "new-password", "confirm-password", "password"].forEach((id) => { $(id).value = ""; });
     $("password").value = "";
     state.path = "";
     await enterApp();

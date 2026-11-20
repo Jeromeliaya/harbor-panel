@@ -6,11 +6,21 @@ services:
     image: harbor-panel:local
     init: true
     network_mode: host
-    environment:
-      HARBOR_PASSWORD: ${HARBOR_PASSWORD:-}
     volumes:
       - workspace:/data/workspace
       - state:/data/state
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ ! -f /data/state/auth.sqlite3 ] && [ ! -f /data/state/bootstrap.token ]; then
+          umask 077
+          head -c 32 /dev/urandom | base64 | tr -d '\\n' > /data/state/bootstrap.token
+          printf '\\n' >> /data/state/bootstrap.token
+          echo 'Initial administrator registration credential (Base64):'
+          cat /data/state/bootstrap.token
+        fi
+        exec python server.py --host 127.0.0.1 --port 8088 --root /data/workspace --state-dir /data/state --bootstrap-token-file /data/state/bootstrap.token
     read_only: true
     cap_drop:
       - ALL

@@ -76,15 +76,8 @@ fi
 "$APP_DIR/.venv/bin/python" -m pip install --disable-pip-version-check -r "$APP_DIR/requirements.txt"
 chown -R "$APP_USER":"$APP_USER" "$APP_DIR/.venv" "$WORKSPACE" "$STATE_DIR"
 
-if [ ! -f /etc/harbor-panel.env ]; then
-    umask 077
-    printf '%s\n' 'HARBOR_PASSWORD=' > /etc/harbor-panel.env
-    chown root:root /etc/harbor-panel.env
-    chmod 600 /etc/harbor-panel.env
-fi
-
 echo "Harbor Panel dependencies and data directories are ready."
-echo "Set a strong HARBOR_PASSWORD in /etc/harbor-panel.env before starting the service."
+echo "The first start requires an administrator registration credential. Create /var/lib/harbor-panel/bootstrap.token with a random Base64 token and owner harbor:harbor, mode 0600."
 if command -v systemctl >/dev/null 2>&1; then
     echo "systemd: cp $APP_DIR/deploy/harbor-panel.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now harbor-panel"
 else

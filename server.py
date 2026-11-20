@@ -1,6 +1,7 @@
 """Harbor Panel: a single-host operations workspace. Python 3.10+."""
 
 import argparse
+import base64
 from collections import defaultdict, deque
 from contextlib import closing
 from http.cookies import SimpleCookie, CookieError
@@ -29,11 +30,30 @@ LOG = logging.getLogger("harbor")
 class Auth:
     TTL = 8 * 3600
 
-    def __init__(self, password):
-        if len(password) < 12:
-            raise ValueError("HARBOR_PASSWORD must contain at least 12 characters.")
+    def __init__(self, password=None, bootstrap_token_file=None, state_dir=None):
         self.salt = secrets.token_bytes(32)
-        self.password_hash = self._hash(password)
+        self.password_hash = None
+        self.legacy_password_hash = None
+        self.username = None
+        self.bootstrap_token_file = Path(bootstrap_token_file) if bootstrap_token_file else None
+        self.bootstrap_token_hash = None
+        self.bootstrap_salt = secrets.token_bytes(32)
+        self.auth_path = Path(state_dir) / "auth.sqlite3" if state_dir else None
+        if password is not None:
+            if len(password) < 12:
+                raise ValueError("HARBOR_PASSWORD must contain at least 12 characters.")
+            self.legacy_password_hash = self._hash(password)
+        if self.auth_path:
+            self.auth_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with closing(sqlite3.connect(self.auth_path)) as connection, connection:
+                connection.execute("CREATE TABLE IF NOT EXISTS administrator (id INTEGER PRIMARY KEY CHECK (id=1), username TEXT NOT NULL, salt BLOB NOT NULL, password_hash BLOB NOT NULL)")
+                row = connection.execute("SELECT username, salt, password_hash FROM administrator WHERE id=1").fetchone()
+            os.chmod(self.auth_path, 0o600)
+            if row:
+                self.username, self.salt, self.password_hash = row
+            elif self.bootstrap_token_file and self.bootstrap_token_file.is_file():
+                token = self.bootstrap_token_file.read_text(encoding="ascii").strip()
+                self.bootstrap_token_hash = hashlib.sha256(token.encode("utf-8")).digest()
         self.sessions = {}
         self.attempts = defaultdict(deque)
         self.lock = threading.RLock()
@@ -41,7 +61,7 @@ class Auth:
     def _hash(self, password):
         return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), self.salt, 210000)
 
-    def login(self, password, address):
+    def _create_session(self, address, username, password):
         now = time.monotonic()
         with self.lock:
             self.attempts = defaultdict(deque, {ip: deque(t for t in times if now - t < 60) for ip, times in self.attempts.items() if times and now - times[-1] < 60})
@@ -49,8 +69,14 @@ class Auth:
             if len(attempts) >= 5 or len(self.attempts) > 1024:
                 raise PanelError("Too many login attempts. Try again in one minute.", 429)
             attempts.append(now)
-        if not isinstance(password, str) or not hmac.compare_digest(self._hash(password), self.password_hash):
-            raise PanelError("Invalid administrator password.", 401)
+        using_legacy = self.auth_path is None
+        expected_hash = self.legacy_password_hash if using_legacy else self.password_hash
+        password_hash = self._hash(password) if isinstance(password, str) and expected_hash is not None else None
+        valid = password_hash is not None and hmac.compare_digest(password_hash, expected_hash)
+        if self.auth_path:
+            valid = valid and isinstance(username, str) and hmac.compare_digest(username.encode("utf-8"), self.username.encode("utf-8"))
+        if not valid:
+            raise PanelError("Invalid administrator username or password.", 401)
         with self.lock:
             self.attempts.pop(address, None)
             self.sessions = {token: session for token, session in self.sessions.items() if session["expires"] > now}
@@ -60,6 +86,41 @@ class Auth:
             token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
             self.sessions[token] = {"csrf": csrf, "expires": now + self.TTL}
         return token, csrf
+
+    def login(self, username, password, address):
+        return self._create_session(address, username, password)
+
+    def setup_required(self):
+        return bool(self.auth_path and self.username is None)
+
+    def register(self, credential, username, password, confirmation, address):
+        with self.lock:
+            if not self.setup_required():
+                raise PanelError("Administrator registration is unavailable.", 409)
+            if self.bootstrap_token_hash is None:
+                raise PanelError("The one-time credential is unavailable. Contact the server administrator.", 503)
+            if not isinstance(username, str) or not 3 <= len(username.strip()) <= 64 or any(ord(char) < 32 for char in username):
+                raise PanelError("Username must contain 3 to 64 printable characters.", 400)
+            username = username.strip()
+            if not isinstance(password, str) or len(password) < 12 or len(password) > 1024:
+                raise PanelError("Password must contain 12 to 1024 characters.", 400)
+            if password != confirmation:
+                raise PanelError("Passwords do not match.", 400)
+            if not isinstance(credential, str) or not hmac.compare_digest(hashlib.sha256(credential.encode("utf-8")).digest(), self.bootstrap_token_hash):
+                raise PanelError("Invalid one-time credential.", 401)
+            salt = secrets.token_bytes(32)
+            password_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 210000)
+            try:
+                with closing(sqlite3.connect(self.auth_path, timeout=5)) as connection, connection:
+                    connection.execute("INSERT INTO administrator (id, username, salt, password_hash) VALUES (1, ?, ?, ?)", (username, salt, password_hash))
+            except sqlite3.IntegrityError:
+                raise PanelError("Administrator registration has already been completed.", 409)
+            self.username, self.salt, self.password_hash = username, salt, password_hash
+            self.bootstrap_token_hash = None
+            if self.bootstrap_token_file:
+                if self.bootstrap_token_file.exists():
+                    self.bootstrap_token_file.unlink()
+        return self._create_session(address, username, password)
 
     def session(self, token):
         with self.lock:
@@ -98,12 +159,12 @@ class PanelServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, password, root, state_dir, public_origin=None):
+    def __init__(self, address, password, root, state_dir, public_origin=None, bootstrap_token_file=None):
         self.files = FileStore(root)
         state = Path(state_dir).resolve()
         if state.is_relative_to(self.files.root):
             raise ValueError("The state directory must be outside the managed file root.")
-        self.auth = Auth(password)
+        self.auth = Auth(password if not bootstrap_token_file else None, bootstrap_token_file, state)
         self.audit = Audit(state)
         self.workers = threading.BoundedSemaphore(32)
         super().__init__(address, Handler)
@@ -229,15 +290,28 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             relative = query.get("path", [""])[0]
             address = self.client_address[0]
+            if path == "/api/setup" and self.command == "GET":
+                self._respond(200, {"required": self.server.auth.setup_required()})
+                return
             if path == "/api/login" and self.command == "POST":
                 body = self._body()
                 try:
-                    token, csrf = self.server.auth.login(body.get("password"), address)
+                    token, csrf = self.server.auth.login(body.get("username"), body.get("password"), address)
                 except PanelError:
                     self.server.audit.add("login", "administrator", address, False)
                     raise
                 self.server.auth.logout(self._token())
                 self.server.audit.add("login", "administrator", address)
+                self._respond(200, {"csrf": csrf}, headers={"Set-Cookie": self._cookie(token)})
+                return
+            if path == "/api/register" and self.command == "POST":
+                body = self._body()
+                try:
+                    token, csrf = self.server.auth.register(body.get("credential"), body.get("username"), body.get("password"), body.get("confirmation"), address)
+                except PanelError:
+                    self.server.audit.add("register", "administrator", address, False)
+                    raise
+                self.server.audit.add("register", body.get("username", "administrator"), address)
                 self._respond(200, {"csrf": csrf}, headers={"Set-Cookie": self._cookie(token)})
                 return
             if path.startswith("/api/"):
@@ -338,19 +412,26 @@ def main():
     parser.add_argument("--root", type=Path, default=BASE / "workspace")
     parser.add_argument("--state-dir", type=Path, default=BASE / ".state")
     parser.add_argument("--public-origin", help="HTTPS origin when deployed behind a trusted reverse proxy")
+    parser.add_argument("--bootstrap-token-file", type=Path, help="One-time administrator registration credential file")
     args = parser.parse_args()
     if args.host not in ("127.0.0.1", "localhost") and not args.public_origin:
         parser.error("Non-loopback binding requires --public-origin https://your-panel-domain")
-    password = os.environ.get("HARBOR_PASSWORD") or secrets.token_urlsafe(18)
+    password = os.environ.get("HARBOR_PASSWORD")
+    if not args.bootstrap_token_file and not password:
+        token_file = Path(args.state_dir) / "bootstrap.token"
+        if not token_file.exists():
+            token_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            credential = secrets.token_bytes(32)
+            token_file.write_text(base64.b64encode(credential).decode("ascii"), encoding="ascii")
+            os.chmod(token_file, 0o600)
+        args.bootstrap_token_file = token_file
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        server = PanelServer((args.host, args.port), password, args.root, args.state_dir, args.public_origin)
+        server = PanelServer((args.host, args.port), password, args.root, args.state_dir, args.public_origin, args.bootstrap_token_file)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     url = args.public_origin or f"http://{args.host}:{server.server_address[1]}"
     print(f"\n  HARBOR PANEL 0.1.0\n  URL: {url}\n  File root: {server.files.root}", flush=True)
-    if not os.environ.get("HARBOR_PASSWORD"):
-        print(f"  Temporary admin password: {password}\n  Set HARBOR_PASSWORD for a stable password.\n", flush=True)
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

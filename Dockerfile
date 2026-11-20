@@ -20,4 +20,4 @@ USER 10001:10001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8088), timeout=3).close()"]
 
-CMD ["python", "server.py", "--host", "127.0.0.1", "--port", "8088", "--root", "/data/workspace", "--state-dir", "/data/state"]
+CMD ["python", "server.py", "--host", "127.0.0.1", "--port", "8088", "--root", "/data/workspace", "--state-dir", "/data/state", "--bootstrap-token-file", "/data/state/bootstrap.token"]

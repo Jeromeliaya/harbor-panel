@@ -7,6 +7,7 @@ APP_DIR=${HARBOR_PANEL_DIR:-/opt/harbor-panel}
 ARCHIVE_URL="$REPOSITORY/archive/refs/heads/$BRANCH.tar.gz"
 TMP_DIR=
 PORT_FILE=/etc/harbor-panel.port
+TOKEN_FILE=/var/lib/harbor-panel/bootstrap.token
 
 cleanup() {
     if [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ]; then
@@ -77,8 +78,21 @@ configure_port() {
 
 install_panel() {
     selected_port=$(read_port)
+    if [ -f /var/lib/harbor-panel/auth.sqlite3 ]; then
+        echo "检测到已有管理员账户，安装不会重新生成注册凭证。"
+        bootstrap_token=
+    else
+        bootstrap_token=
+    fi
     fetch_source
     HARBOR_PANEL_DIR="$APP_DIR" sh "$APP_DIR/deploy/install.sh"
+    if [ ! -f /var/lib/harbor-panel/auth.sqlite3 ]; then
+        bootstrap_token=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -d '\n')
+        umask 077
+        printf '%s\n' "$bootstrap_token" > "$TOKEN_FILE"
+        chown harbor:harbor "$TOKEN_FILE"
+        chmod 600 "$TOKEN_FILE"
+    fi
     configure_port "$selected_port"
     if command -v systemctl >/dev/null 2>&1; then
         install -m 644 "$APP_DIR/deploy/harbor-panel.service" /etc/systemd/system/harbor-panel.service
@@ -92,6 +106,10 @@ install_panel() {
         echo "未检测到 systemd 或 OpenRC，源码已安装，请手动启动服务。"
     fi
     echo "安装完成，访问 http://127.0.0.1:$selected_port。"
+    if [ -n "${bootstrap_token:-}" ]; then
+        echo "首次注册一次性凭证（Base64），请立即安全保存："
+        printf '%s\n' "$bootstrap_token"
+    fi
 }
 
 update_panel() {
