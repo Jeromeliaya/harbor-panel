@@ -17,7 +17,7 @@ start_pre() {
         . /etc/harbor-panel.port
         export HARBOR_PANEL_PORT
     fi
-    command_args="/opt/harbor-panel/server.py --port ${HARBOR_PANEL_PORT:-8088} --root /srv/harbor-workspace --state-dir /var/lib/harbor-panel --bootstrap-token-file /var/lib/harbor-panel/bootstrap.token"
+    command_args="/opt/harbor-panel/server.py --host 0.0.0.0 --port ${HARBOR_PANEL_PORT:-8088} --root /srv/harbor-workspace --state-dir /var/lib/harbor-panel --bootstrap-token-file /var/lib/harbor-panel/bootstrap.token"
 }
 
 depend() {

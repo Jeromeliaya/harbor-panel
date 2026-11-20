@@ -184,6 +184,29 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/api/terminal", {"command": "help"}, {"X-CSRF-Token": "é"})[0], 403)
         self.assertEqual(self.request("POST", "/api/terminal", {"command": "help"}, {"Origin": ""})[0], 403)
 
+    def test_public_bind_accepts_matching_http_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = PanelServer(("0.0.0.0", 0), "long-enough-password", root / "files", root / "state")
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = server.server_address[1]
+                connection = HTTPConnection("127.0.0.1", port, timeout=10)
+                connection.request(
+                    "POST",
+                    "/api/login",
+                    json.dumps({"username": "administrator", "password": "wrong"}),
+                    {"Content-Type": "application/json", "Host": f"198.51.100.10:{port}", "Origin": f"http://198.51.100.10:{port}"},
+                )
+                self.assertEqual(connection.getresponse().status, 401)
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                server.host.close()
+
     def test_malformed_and_oversized_requests(self):
         self.assertEqual(self.request("POST", "/api/login", raw=b"{", headers={"Content-Type": "application/json"})[0], 400)
         self.assertEqual(self.request("POST", "/api/login", raw=b"[]", headers={"Content-Type": "application/json"})[0], 400)

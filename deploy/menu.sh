@@ -86,6 +86,25 @@ start_systemd_service() {
     fi
 }
 
+print_access_url() {
+    selected_port=$1
+    public_ip=
+    if command -v curl >/dev/null 2>&1; then
+        public_ip=$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
+    elif command -v wget >/dev/null 2>&1; then
+        public_ip=$(wget -qO- -T 5 https://api.ipify.org 2>/dev/null || true)
+    fi
+    case "$public_ip" in
+        *[!0-9.]*|'')
+            echo "安装完成，服务端口：$selected_port。请使用 VPS 公网 IP 访问：http://<VPS公网IP>:$selected_port"
+            ;;
+        *)
+            echo "安装完成，访问 http://$public_ip:$selected_port。"
+            ;;
+    esac
+    echo "请确认 VPS 云安全组和系统防火墙已放行 TCP $selected_port。"
+}
+
 install_panel() {
     selected_port=$(read_port)
     if [ -f /var/lib/harbor-panel/auth.sqlite3 ]; then
@@ -116,7 +135,7 @@ install_panel() {
     else
         echo "未检测到 systemd 或 OpenRC，源码已安装，请手动启动服务。"
     fi
-    echo "安装完成，访问 http://127.0.0.1:$selected_port。"
+    print_access_url "$selected_port"
     if [ -n "${bootstrap_token:-}" ]; then
         echo "首次注册一次性凭证（Base64），请立即安全保存："
         printf '%s\n' "$bootstrap_token"

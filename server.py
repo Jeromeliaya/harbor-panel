@@ -8,6 +8,7 @@ from http.cookies import SimpleCookie, CookieError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -169,6 +170,7 @@ class PanelServer(ThreadingHTTPServer):
         self.workers = threading.BoundedSemaphore(32)
         super().__init__(address, Handler)
         port = self.server_address[1]
+        self.public_bind = self.server_address[0] not in ("127.0.0.1", "::1")
         self.origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
         self.secure_cookie = False
         if public_origin:
@@ -275,15 +277,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, mutation):
         try:
-            if self.headers.get("Host", "").lower() not in self.server.allowed_hosts:
-                raise PanelError("Unrecognized Host header.", 403)
+            host = self.headers.get("Host", "").lower()
+            if host not in self.server.allowed_hosts:
+                try:
+                    ipaddress.ip_address(urlsplit(f"//{host}").hostname or "")
+                except ValueError:
+                    if not self.server.public_bind:
+                        raise PanelError("Unrecognized Host header.", 403)
+                    raise PanelError("Public access requires an IP address Host header or configured origin.", 403)
+                if not self.server.public_bind:
+                    raise PanelError("Unrecognized Host header.", 403)
             navigation = self.command == "GET" and self.headers.get("Sec-Fetch-Mode") == "navigate" and not urlsplit(self.path).path.startswith("/api/")
             if self.headers.get("Sec-Fetch-Site") == "cross-site" and not navigation:
                 raise PanelError("Cross-site requests are not allowed.", 403)
             origin = self.headers.get("Origin")
-            if origin and origin not in self.server.origins:
+            public_origin = f"http://{host}"
+            if origin and origin not in self.server.origins and not (self.server.public_bind and origin == public_origin):
                 raise PanelError("Origin is not allowed.", 403)
-            if mutation and origin not in self.server.origins:
+            if mutation and origin not in self.server.origins and not (self.server.public_bind and origin == public_origin):
                 raise PanelError("An allowed Origin header is required.", 403)
             parsed = urlsplit(self.path)
             path = parsed.path
@@ -414,8 +425,6 @@ def main():
     parser.add_argument("--public-origin", help="HTTPS origin when deployed behind a trusted reverse proxy")
     parser.add_argument("--bootstrap-token-file", type=Path, help="One-time administrator registration credential file")
     args = parser.parse_args()
-    if args.host not in ("127.0.0.1", "localhost") and not args.public_origin:
-        parser.error("Non-loopback binding requires --public-origin https://your-panel-domain")
     password = os.environ.get("HARBOR_PASSWORD")
     if not args.bootstrap_token_file and not password:
         token_file = Path(args.state_dir) / "bootstrap.token"
@@ -430,7 +439,8 @@ def main():
         server = PanelServer((args.host, args.port), password, args.root, args.state_dir, args.public_origin, args.bootstrap_token_file)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
-    url = args.public_origin or f"http://{args.host}:{server.server_address[1]}"
+    display_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
+    url = args.public_origin or f"http://{display_host}:{server.server_address[1]}"
     print(f"\n  HARBOR PANEL 0.1.0\n  URL: {url}\n  File root: {server.files.root}", flush=True)
     try:
         server.serve_forever(poll_interval=0.25)

@@ -11,7 +11,7 @@ EnvironmentFile=-/etc/harbor-panel.env
 Environment=HARBOR_PANEL_PORT=8088
 EnvironmentFile=-/etc/harbor-panel.port
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/opt/harbor-panel/.venv/bin/python /opt/harbor-panel/server.py --port ${HARBOR_PANEL_PORT} --root /srv/harbor-workspace --state-dir /var/lib/harbor-panel --bootstrap-token-file /var/lib/harbor-panel/bootstrap.token
+ExecStart=/opt/harbor-panel/.venv/bin/python /opt/harbor-panel/server.py --host 0.0.0.0 --port ${HARBOR_PANEL_PORT} --root /srv/harbor-workspace --state-dir /var/lib/harbor-panel --bootstrap-token-file /var/lib/harbor-panel/bootstrap.token
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
