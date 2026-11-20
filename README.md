@@ -133,7 +133,7 @@ curl -fsSL https://raw.githubusercontent.com/Jeromeliaya/harbor-panel/main/deplo
 sudo sh /tmp/harbor-panel-menu.sh
 ```
 
-菜单选项：`1` 安装、`2` 更新、`3` 卸载、`0` 退出。选择安装时会提示输入服务端口，允许 `0-65535`，直接回车使用默认端口 `8088`；端口配置保存于 `/etc/harbor-panel.port`，后续更新会自动沿用。端口 `0` 由操作系统临时分配，适合测试，不适合作为固定访问地址。卸载需要输入 `UNINSTALL` 确认，只删除程序文件和服务配置，保留 `/srv/harbor-workspace`、`/var/lib/harbor-panel` 与 `/etc/harbor-panel.env`。如服务器没有 `curl`，可使用 `wget` 替代下载菜单脚本。
+菜单选项：`1` 安装、`2` 更新、`3` 卸载、`0` 退出。选择安装时会提示输入服务端口，允许 `0-65535`，直接回车使用默认端口 `8088`；端口配置保存于 `/etc/harbor-panel.port`，后续更新会自动沿用。端口 `0` 由操作系统临时分配，适合测试，不适合作为固定访问地址。卸载需要输入 `UNINSTALL` 确认，清除管理员账户和注册凭证以使其失效，保留 `/srv/harbor-workspace`、审计数据及 `/etc/harbor-panel.env`；重新安装会生成新的注册凭证。更新不会重置账户或凭证。如服务器没有 `curl`，可使用 `wget` 替代下载菜单脚本。
 
 源码默认放在 `/opt/harbor-panel` 时，在项目目录执行：
 

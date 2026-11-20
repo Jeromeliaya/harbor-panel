@@ -106,22 +106,18 @@ print_access_url() {
 }
 
 install_panel() {
-    selected_port=$(read_port)
-    if [ -f /var/lib/harbor-panel/auth.sqlite3 ]; then
-        echo "检测到已有管理员账户，安装不会重新生成注册凭证。"
-        bootstrap_token=
-    else
-        bootstrap_token=
+    if [ -f "$APP_DIR/server.py" ]; then
+        echo "检测到已安装的 Harbor Panel。请选择更新，或先卸载后再重新安装以重置注册凭证。"
+        return
     fi
+    selected_port=$(read_port)
     fetch_source
     HARBOR_PANEL_DIR="$APP_DIR" sh "$APP_DIR/deploy/install.sh"
-    if [ ! -f /var/lib/harbor-panel/auth.sqlite3 ]; then
-        bootstrap_token=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -d '\n')
-        umask 077
-        printf '%s\n' "$bootstrap_token" > "$TOKEN_FILE"
-        chown harbor:harbor "$TOKEN_FILE"
-        chmod 600 "$TOKEN_FILE"
-    fi
+    bootstrap_token=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -d '\n')
+    umask 077
+    printf '%s\n' "$bootstrap_token" > "$TOKEN_FILE"
+    chown harbor:harbor "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
     configure_port "$selected_port"
     if command -v systemctl >/dev/null 2>&1; then
         install -m 644 "$APP_DIR/deploy/harbor-panel.service" /etc/systemd/system/harbor-panel.service
@@ -193,8 +189,9 @@ uninstall_panel() {
         rm -f /etc/init.d/harbor-panel
     fi
     rm -rf "$APP_DIR"
+    rm -f "$TOKEN_FILE" /var/lib/harbor-panel/auth.sqlite3
     id harbor >/dev/null 2>&1 && userdel harbor 2>/dev/null || true
-    echo "程序已卸载。数据仍保留在 /srv/harbor-workspace、/var/lib/harbor-panel 和 /etc/harbor-panel.env。"
+    echo "程序已卸载，旧注册凭证及管理员账户已失效。工作区、审计数据及 /etc/harbor-panel.env 已保留。重新安装会生成新的注册凭证。"
 }
 
 while :; do
