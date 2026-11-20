@@ -76,6 +76,16 @@ configure_port() {
     fi
 }
 
+start_systemd_service() {
+    action=$1
+    if ! systemctl "$action" harbor-panel; then
+        echo "Harbor Panel 服务启动或重启失败。systemd 状态和最近日志：" >&2
+        systemctl status --no-pager --full harbor-panel >&2 || true
+        journalctl --no-pager -n 40 -u harbor-panel >&2 || true
+        return 1
+    fi
+}
+
 install_panel() {
     selected_port=$(read_port)
     if [ -f /var/lib/harbor-panel/auth.sqlite3 ]; then
@@ -97,7 +107,8 @@ install_panel() {
     if command -v systemctl >/dev/null 2>&1; then
         install -m 644 "$APP_DIR/deploy/harbor-panel.service" /etc/systemd/system/harbor-panel.service
         systemctl daemon-reload
-        systemctl enable --now harbor-panel
+        systemctl enable harbor-panel
+        start_systemd_service start
     elif [ -x "$APP_DIR/deploy/harbor-panel.openrc" ] || [ -f /sbin/rc-service ]; then
         install -m 755 "$APP_DIR/deploy/harbor-panel.openrc" /etc/init.d/harbor-panel
         rc-update add harbor-panel default
@@ -128,7 +139,7 @@ update_panel() {
     if command -v systemctl >/dev/null 2>&1; then
         install -m 644 "$APP_DIR/deploy/harbor-panel.service" /etc/systemd/system/harbor-panel.service
         systemctl daemon-reload
-        systemctl restart harbor-panel
+        start_systemd_service restart
     elif [ -f /etc/init.d/harbor-panel ]; then
         install -m 755 "$APP_DIR/deploy/harbor-panel.openrc" /etc/init.d/harbor-panel
         rc-service harbor-panel restart
