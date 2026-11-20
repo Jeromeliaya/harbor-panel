@@ -4,7 +4,7 @@ name="Harbor Panel"
 description="Harbor Panel single-host operations workspace"
 directory="/opt/harbor-panel"
 command="/opt/harbor-panel/.venv/bin/python"
-command_args="/opt/harbor-panel/server.py --root /srv/harbor-workspace --state-dir /var/lib/harbor-panel"
+command_args=""
 command_user="harbor:harbor"
 command_background=true
 pidfile="/run/${RC_SVCNAME}.pid"
@@ -13,10 +13,15 @@ error_log="/var/log/harbor-panel.log"
 export PYTHONDONTWRITEBYTECODE=1
 
 start_pre() {
+    if [ -r /etc/harbor-panel.port ]; then
+        . /etc/harbor-panel.port
+        export HARBOR_PANEL_PORT
+    fi
     if [ -r /etc/harbor-panel.env ]; then
         . /etc/harbor-panel.env
         export HARBOR_PASSWORD
     fi
+    command_args="/opt/harbor-panel/server.py --port ${HARBOR_PANEL_PORT:-8088} --root /srv/harbor-workspace --state-dir /var/lib/harbor-panel"
 }
 
 depend() {

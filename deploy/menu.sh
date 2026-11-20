@@ -6,6 +6,7 @@ BRANCH=${HARBOR_PANEL_BRANCH:-main}
 APP_DIR=${HARBOR_PANEL_DIR:-/opt/harbor-panel}
 ARCHIVE_URL="$REPOSITORY/archive/refs/heads/$BRANCH.tar.gz"
 TMP_DIR=
+PORT_FILE=/etc/harbor-panel.port
 
 cleanup() {
     if [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ]; then
@@ -44,9 +45,41 @@ fetch_source() {
     cp -R "$source_dir"/. "$APP_DIR"/
 }
 
+read_port() {
+    while :; do
+        printf '请输入服务端口 (0-65535，默认 8088): ' >&2
+        read port || port=
+        port=${port:-8088}
+        case "$port" in
+            *[!0-9]*) echo "端口必须是 0 到 65535 的整数。" >&2 ;;
+            *)
+                if [ "${#port}" -gt 5 ] || [ "$port" -gt 65535 ]; then
+                    echo "端口必须在 0 到 65535 之间。" >&2
+                else
+                    printf '%s\n' "$port"
+                    return 0
+                fi
+                ;;
+        esac
+    done
+}
+
+configure_port() {
+    selected_port=$1
+    umask 077
+    printf 'HARBOR_PANEL_PORT=%s\n' "$selected_port" > "$PORT_FILE"
+    if command -v systemctl >/dev/null 2>&1; then
+        install -m 644 "$APP_DIR/deploy/harbor-panel.service" /etc/systemd/system/harbor-panel.service
+    elif [ -f /etc/init.d/harbor-panel ] || [ -f /sbin/rc-service ]; then
+        install -m 755 "$APP_DIR/deploy/harbor-panel.openrc" /etc/init.d/harbor-panel
+    fi
+}
+
 install_panel() {
+    selected_port=$(read_port)
     fetch_source
     HARBOR_PANEL_DIR="$APP_DIR" sh "$APP_DIR/deploy/install.sh"
+    configure_port "$selected_port"
     if command -v systemctl >/dev/null 2>&1; then
         install -m 644 "$APP_DIR/deploy/harbor-panel.service" /etc/systemd/system/harbor-panel.service
         systemctl daemon-reload
@@ -58,7 +91,7 @@ install_panel() {
     else
         echo "未检测到 systemd 或 OpenRC，源码已安装，请手动启动服务。"
     fi
-    echo "安装完成，访问 http://127.0.0.1:8088。"
+    echo "安装完成，访问 http://127.0.0.1:$selected_port。"
 }
 
 update_panel() {
@@ -68,6 +101,12 @@ update_panel() {
     fi
     fetch_source
     HARBOR_PANEL_DIR="$APP_DIR" sh "$APP_DIR/deploy/install.sh"
+    selected_port=8088
+    if [ -f "$PORT_FILE" ]; then
+        . "$PORT_FILE"
+        selected_port=${HARBOR_PANEL_PORT:-8088}
+    fi
+    configure_port "$selected_port"
     if command -v systemctl >/dev/null 2>&1; then
         install -m 644 "$APP_DIR/deploy/harbor-panel.service" /etc/systemd/system/harbor-panel.service
         systemctl daemon-reload
