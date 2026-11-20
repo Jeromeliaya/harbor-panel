@@ -128,7 +128,8 @@ docker compose down
 也可以直接通过 `curl` 打开交互式管理菜单。菜单提供安装、更新、卸载和退出；源码从本仓库下载，更新不会删除工作区、审计数据库或密码配置：
 
 ```sh
-sudo sh -c "\$(curl -fsSL https://raw.githubusercontent.com/Jeromeliaya/harbor-panel/main/deploy/menu.sh)"
+curl -fsSL https://raw.githubusercontent.com/Jeromeliaya/harbor-panel/main/deploy/menu.sh -o /tmp/harbor-panel-menu.sh
+sudo sh /tmp/harbor-panel-menu.sh
 ```
 
 菜单选项：`1` 安装、`2` 更新、`3` 卸载、`0` 退出。选择安装时会提示输入服务端口，允许 `0-65535`，直接回车使用默认端口 `8088`；端口配置保存于 `/etc/harbor-panel.port`，后续更新会自动沿用。端口 `0` 由操作系统临时分配，适合测试，不适合作为固定访问地址。卸载需要输入 `UNINSTALL` 确认，只删除程序文件和服务配置，保留 `/srv/harbor-workspace`、`/var/lib/harbor-panel` 与 `/etc/harbor-panel.env`。如服务器没有 `curl`，可使用 `wget` 替代下载菜单脚本。
