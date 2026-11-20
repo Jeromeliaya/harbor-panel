@@ -1,0 +1,25 @@
+#!/sbin/openrc-run
+
+name="Harbor Panel"
+description="Harbor Panel single-host operations workspace"
+directory="/opt/harbor-panel"
+command="/opt/harbor-panel/.venv/bin/python"
+command_args="/opt/harbor-panel/server.py --root /srv/harbor-workspace --state-dir /var/lib/harbor-panel"
+command_user="harbor:harbor"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/harbor-panel.log"
+error_log="/var/log/harbor-panel.log"
+export PYTHONDONTWRITEBYTECODE=1
+
+start_pre() {
+    if [ -r /etc/harbor-panel.env ]; then
+        . /etc/harbor-panel.env
+        export HARBOR_PASSWORD
+    fi
+}
+
+depend() {
+    need net
+    after firewall
+}

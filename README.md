@@ -112,12 +112,38 @@ docker compose down
 
 ## Linux 部署
 
-需要直接监控和管理宿主机时，推荐使用以下原生部署方式。
+需要直接监控和管理宿主机时，推荐使用原生部署方式。应用只依赖 Python 3.10+ 和 `psutil`，不绑定 Debian、Ubuntu、Alpine 或 CentOS 的专用系统 API。
+
+### 发行版安装
+
+仓库提供 POSIX `sh` 安装脚本，会读取 `/etc/os-release` 并选择对应的软件包管理器：
+
+| 系统 | 包管理器 | 服务管理器 |
+| --- | --- | --- |
+| Debian / Ubuntu / Linux Mint | `apt` | systemd |
+| Alpine Linux | `apk` | OpenRC |
+| CentOS / Rocky / AlmaLinux / RHEL / Fedora | `dnf` 或 `yum` | 通常为 systemd |
+
+源码默认放在 `/opt/harbor-panel` 时，在项目目录执行：
+
+```sh
+sudo sh deploy/install.sh
+```
+
+如果源码位于其他目录，设置 `HARBOR_PANEL_DIR`；也可以用环境变量调整面板用户和数据目录。脚本不会覆盖已有的 `/etc/harbor-panel.env`、工作区或审计数据库：
+
+```sh
+sudo HARBOR_PANEL_DIR=/srv/harbor-panel sh deploy/install.sh
+```
+
+脚本会安装 Python、pip、虚拟环境组件和 `psutil` 所需的构建依赖，创建普通用户 `harbor`，并生成权限为 `0600` 的 `/etc/harbor-panel.env`。启动前必须编辑该文件设置至少 12 字符的 `HARBOR_PASSWORD`。
+
+Debian/Ubuntu、CentOS/RHEL/Fedora 使用 `deploy/harbor-panel.service`；Alpine 使用 `deploy/harbor-panel.openrc`。脚本最后会打印当前系统对应的启用命令。若自定义了 `HARBOR_PANEL_DIR`、`HARBOR_PANEL_WORKSPACE` 或 `HARBOR_PANEL_STATE`，请同步修改服务模板中的路径。
 
 1. 将此目录放到 `/opt/harbor-panel` 并安装虚拟环境依赖。
 2. 创建专用普通用户 `harbor`、其可读写的 `/srv/harbor-workspace` 与 `/var/lib/harbor-panel`。
 3. 创建 `/etc/harbor-panel.env`，写入 `HARBOR_PASSWORD=你的强密码`，权限设置为 `0600`，由 root 所有。
-4. 将 `deploy/harbor-panel.service` 复制到 `/etc/systemd/system/`，确认文件路径和账户正确，再执行 `systemctl daemon-reload`、`systemctl enable --now harbor-panel`。
+4. 将对应的 systemd 或 OpenRC 服务模板复制到系统服务目录，确认文件路径和账户正确，再启用服务。
 5. 本地使用 SSH 隧道：`ssh -L 8088:127.0.0.1:8088 user@your-server`，然后访问本机 `http://127.0.0.1:8088`。
 
 如需使用域名，在 HTTPS 反向代理后运行，并在 service 的 `ExecStart` 末尾添加 `--public-origin https://panel.example.com`。外部 Origin 必须精确匹配协议、主机及非默认端口；该模式设置 Secure Cookie，必须使用 HTTPS 浏览器入口。反向代理要保留 Host，例如已有 TLS Nginx server 内配置：
@@ -164,6 +190,8 @@ harbor-panel/
   web/            原创中文管理界面，无构建步骤
   tests/          标准库 unittest 测试
   deploy/         Linux systemd 示例
+  deploy/install.sh       Debian/Ubuntu/Alpine/CentOS 安装脚本
+  deploy/harbor-panel.openrc  Alpine OpenRC 服务示例
   Dockerfile      非 root 容器镜像
   compose.yaml    Compose 启动与持久化配置
   .env.example    可选固定密码配置模板
