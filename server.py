@@ -344,7 +344,10 @@ class Handler(BaseHTTPRequestHandler):
             content_type = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
             self._respond(200, asset.read_bytes(), content_type + "; charset=utf-8")
         except PanelError as exc:
-            self._respond(exc.status, {"error": str(exc)})
+            error = {"error": str(exc)}
+            if exc.code:
+                error["code"] = exc.code
+            self._respond(exc.status, error)
         except PermissionError:
             self._respond(403, {"error": "The panel process does not have permission for this operation."})
         except FileNotFoundError:
@@ -367,6 +370,8 @@ class Handler(BaseHTTPRequestHandler):
             result = self.server.host.processes()
         elif path == "/api/containers":
             result = self.server.host.containers()
+        elif path == "/api/containers/config":
+            result = self.server.host.container_config(query.get("id", [""])[0])
         elif path == "/api/containers/logs":
             result = self.server.host.container_logs(query.get("id", [""])[0])
         elif path == "/api/files":
@@ -384,7 +389,7 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(200, result)
 
     def _write_api(self, path, address, token):
-        routes = {("POST", "/api/logout"), ("POST", "/api/terminal"), ("POST", "/api/containers/action"), ("PUT", "/api/files/write"), ("POST", "/api/files/mkdir")}
+        routes = {("POST", "/api/logout"), ("POST", "/api/terminal"), ("POST", "/api/containers/action"), ("PUT", "/api/containers/config"), ("PUT", "/api/files/write"), ("POST", "/api/files/mkdir")}
         if (self.command, path) not in routes:
             raise PanelError("API route or method not found.", 404)
         body = self._body()
@@ -392,6 +397,8 @@ class Handler(BaseHTTPRequestHandler):
         action = path.removeprefix("/api/").replace("/", ".")
         if path == "/api/containers/action":
             target = f"{body.get('action', '')}:{body.get('id', '')}"
+        elif path == "/api/containers/config":
+            target = body.get("id", "")
         # Record intent before changing resources, then record the result separately.
         self.server.audit.add(action + ".requested", target, address)
         try:
@@ -402,6 +409,10 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.server.host.terminal(body.get("command"))
             elif path == "/api/containers/action":
                 result = self.server.host.container_action(body.get("id"), body.get("action"))
+            elif path == "/api/containers/config":
+                if "id" not in body or "config" not in body:
+                    raise PanelError("id and config are required.")
+                result = self.server.host.update_container(body["id"], body["config"])
             elif path == "/api/files/write":
                 if "path" not in body or "content" not in body or "etag" not in body:
                     raise PanelError("path, content and etag are required (etag=null creates a file).")

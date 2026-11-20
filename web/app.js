@@ -95,7 +95,9 @@ async function api(path, options = {}) {
   if (!login && session !== state.session) throw new Error("会话已更改，请重新操作。");
   if (!response.ok) {
     if (response.status === 401 && !login) showLogin();
-    throw new Error(data.error || `请求失败（HTTP ${response.status}）。`);
+    const error = new Error(data.error || `请求失败（HTTP ${response.status}）。`);
+    error.code = data.code;
+    throw error;
   }
   return data;
 }
@@ -107,7 +109,7 @@ function renderNav() {
 function setConnection(online) {
   const badge = $("connection-badge");
   badge.className = `badge ${online ? "green" : "amber"}`;
-  badge.innerHTML = `<i class="status-dot"></i> ${online ? "实时连接" : "连接中断"}`;
+  badge.innerHTML = `<i class="status-dot"></i> ${online ? "面板已连接" : "面板连接中断"}`;
 }
 
 function empty(title, description, symbol = "folder") {
@@ -115,6 +117,16 @@ function empty(title, description, symbol = "folder") {
 }
 
 function viewError(error) {
+  if (state.view === "containers") {
+    const dockerErrors = {
+      docker_socket_permission: ["Docker 权限不足", "面板服务无法访问 Docker socket。请由 VPS 管理员按 README 的 Docker 权限说明授权并重启面板。Docker 权限接近主机 root 权限。"],
+      docker_cli_missing: ["未找到 Docker CLI", "原生部署请先安装 Docker CLI。默认容器镜像未启用宿主机 Docker 管理。"],
+      docker_daemon_unavailable: ["无法连接 Docker 服务", "请检查 Docker 服务是否正在运行，以及面板使用的 Docker context 是否正确。"],
+    };
+    const [title, description] = Object.prototype.hasOwnProperty.call(dockerErrors, error.code)
+      ? dockerErrors[error.code] : ["Docker 暂不可用", error.message];
+    return `<section class="panel">${empty(title, description, "box")}<div class="dialog-footer"><button class="button secondary" data-retry>重新加载</button></div></section>`;
+  }
   return `<section class="panel">${empty("暂时无法读取数据", error.message, "server")}<div class="dialog-footer"><span class="muted">请确认本机权限与对应服务状态。</span><button class="button secondary" data-retry>重新加载</button></div></section>`;
 }
 
@@ -275,7 +287,55 @@ async function uploadFile(file) {
 
 function renderContainers() {
   const running = state.containers.filter((item) => item.state === "running").length;
-  $("view").innerHTML = `<div class="section-note">连接本机 Docker CLI 与当前 Docker context。启停操作会影响真实容器，请确认目标后执行。</div><section class="panel"><div class="toolbar"><div class="toolbar-group">${icon("box")}<strong>本机容器</strong><span class="badge green">${running} 运行中</span><span class="badge neutral">共 ${state.containers.length} 个</span></div><button class="button secondary small" data-retry>${icon("refresh")}同步容器</button></div>${state.containers.length ? `<div class="table-scroll"><table><thead><tr><th>容器 / 镜像</th><th>状态</th><th>端口</th><th>操作</th></tr></thead><tbody>${state.containers.map((item, index) => `<tr><td><strong>${escapeHTML(item.name)}</strong><p class="cell-secondary mono" title="${escapeHTML(item.image)}">${escapeHTML(item.image)}</p><span class="cell-secondary mono">${escapeHTML(item.id.slice(0, 12))}</span></td><td><span class="badge ${item.state === "running" ? "green" : "neutral"}">${escapeHTML(item.state)}</span><p class="cell-secondary">${escapeHTML(item.status)}</p></td><td class="cell-secondary mono">${escapeHTML(item.ports || "未发布端口")}</td><td><div class="actions"><button class="button ghost small" data-container="${index}" data-action="logs">日志</button>${item.state === "running" ? `<button class="button secondary small" data-container="${index}" data-action="restart">重启</button><button class="button danger small" data-container="${index}" data-action="stop">停止</button>` : `<button class="button secondary small" data-container="${index}" data-action="start">启动</button>`}</div></td></tr>`).join("")}</tbody></table></div>` : empty("还没有容器", "Docker 已连接，目前没有发现容器。", "box")}</section>`;
+  $("view").innerHTML = `<div class="section-note">连接本机 Docker CLI 与当前 Docker context。启停操作会影响真实容器，请确认目标后执行。</div><section class="panel"><div class="toolbar"><div class="toolbar-group">${icon("box")}<strong>本机容器</strong><span class="badge green">${running} 运行中</span><span class="badge neutral">共 ${state.containers.length} 个</span></div><button class="button secondary small" data-retry>${icon("refresh")}同步容器</button></div>${state.containers.length ? `<div class="table-scroll"><table><thead><tr><th>容器 / 镜像</th><th>状态</th><th>端口</th><th>操作</th></tr></thead><tbody>${state.containers.map((item, index) => `<tr><td><strong>${escapeHTML(item.name)}</strong><p class="cell-secondary mono" title="${escapeHTML(item.image)}">${escapeHTML(item.image)}</p><span class="cell-secondary mono">${escapeHTML(item.id.slice(0, 12))}</span></td><td><span class="badge ${item.state === "running" ? "green" : "neutral"}">${escapeHTML(item.state)}</span><p class="cell-secondary">${escapeHTML(item.status)}</p></td><td class="cell-secondary mono">${escapeHTML(item.ports || "未发布端口")}</td><td><div class="actions"><button class="button ghost small" data-container="${index}" data-action="config">编辑</button><button class="button ghost small" data-container="${index}" data-action="logs">日志</button>${item.state === "running" ? `<button class="button secondary small" data-container="${index}" data-action="restart">重启</button><button class="button danger small" data-container="${index}" data-action="stop">停止</button>` : `<button class="button secondary small" data-container="${index}" data-action="start">启动</button>`}</div></td></tr>`).join("")}</tbody></table></div>` : empty("还没有容器", "Docker 已连接，目前没有发现容器。", "box")}</section>`;
+}
+
+function lines(value) { return Array.isArray(value) ? value.join("\n") : ""; }
+
+async function openContainerConfig(index) {
+  const item = state.containers[index];
+  if (!item) return;
+  const generation = state.generation;
+  const data = await api(`containers/config?id=${encodeURIComponent(item.id)}`);
+  if (generation !== state.generation) return;
+  const config = data.config;
+  $("container-config-id").value = data.id;
+  $("container-config-name").value = config.name || "";
+  $("container-config-image").value = config.image || "";
+  $("container-config-command").value = lines(config.command);
+  $("container-config-ports").value = lines(config.ports);
+  $("container-config-environment").value = lines(config.environment);
+  $("container-config-volumes").value = lines(config.volumes);
+  $("container-config-networks").value = lines(config.networks);
+  $("container-config-restart").value = config.restart_policy || "no";
+  $("container-config-memory").value = config.memory_limit || 0;
+  $("container-config-cpu").value = config.cpu_limit || 0;
+  $("container-config-title").textContent = `${config.name || item.name} · 容器配置`;
+  $("container-config-dialog").showModal();
+}
+
+function listField(id) { return $(id).value.split("\n").map((value) => value.trim()).filter(Boolean); }
+
+async function saveContainerConfig(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('[type="submit"]');
+  const body = { id: $("container-config-id").value, config: {
+    name: $("container-config-name").value.trim(), image: $("container-config-image").value.trim(),
+    command: listField("container-config-command"), ports: listField("container-config-ports"),
+    environment: listField("container-config-environment"), volumes: listField("container-config-volumes"),
+    networks: listField("container-config-networks"), restart_policy: $("container-config-restart").value,
+    memory_limit: Number($("container-config-memory").value || 0), cpu_limit: Number($("container-config-cpu").value || 0),
+  }};
+  if (!confirm("保存将停止并重建容器，容器 ID 会改变。挂载卷/目录中的数据通常会保留，未挂载的可写层数据可能丢失；如果创建失败，面板会尝试恢复旧容器。继续？")) return;
+  button.disabled = true;
+  try {
+    await api("containers/config", { method: "PUT", body });
+    $("container-config-dialog").close();
+    toast("容器已按新配置重建。\n");
+    if (state.view === "containers") await navigate();
+  } catch (error) { toast(`重建失败：${error.message}\n如果页面仍显示旧容器，请刷新列表确认状态。`, true); }
+  finally { button.disabled = false; }
 }
 
 async function containerAction(index, action, button) {
@@ -461,6 +521,7 @@ $("folder-form").addEventListener("submit", async (event) => {
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; }
 });
+$("container-config-form").addEventListener("submit", saveContainerConfig);
 
 document.addEventListener("click", async (event) => {
   const target = event.target.closest("button, a");
@@ -483,7 +544,8 @@ document.addEventListener("click", async (event) => {
     if (target.hasAttribute("data-new-file")) openEditor(joinPath(""));
     if (target.hasAttribute("data-new-folder")) { $("folder-name").value = ""; $("folder-dialog").showModal(); }
     if (target.hasAttribute("data-upload")) $("file-upload").click();
-    if (target.hasAttribute("data-container")) await containerAction(Number(target.dataset.container), target.dataset.action, target);
+    if (target.hasAttribute("data-container") && target.dataset.action === "config") await openContainerConfig(Number(target.dataset.container));
+    else if (target.hasAttribute("data-container")) await containerAction(Number(target.dataset.container), target.dataset.action, target);
     if (target.hasAttribute("data-command")) await runCommand(target.dataset.command);
   } catch (error) { toast(error.message, true); }
 });

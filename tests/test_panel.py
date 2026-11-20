@@ -277,7 +277,15 @@ class HTTPTests(unittest.TestCase):
         with mock.patch.object(self.server.host, "docker_command", side_effect=PanelError("Docker offline", 503)):
             status, data, _ = self.request("GET", "/api/containers")
             self.assertEqual(status, 503)
-            self.assertEqual(data["error"], "Docker offline")
+            self.assertEqual(data, {"error": "Docker offline"})
+
+    def test_container_socket_permission_error(self):
+        self.login()
+        error = PanelError("The panel service cannot access the Docker socket.", 503, code="docker_socket_permission")
+        with mock.patch.object(self.server.host, "docker_command", side_effect=error):
+            status, data, _ = self.request("GET", "/api/containers")
+        self.assertEqual(status, 503)
+        self.assertEqual(data, {"error": str(error), "code": "docker_socket_permission"})
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -336,6 +344,81 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaises(PanelError) as context:
                 host.docker_command("-c", "import sys; sys.stdout.write('x' * (2 * 1024 * 1024))")
             self.assertEqual(context.exception.status, 413)
+
+    def test_docker_cli_failure_diagnostics(self):
+        host = Host.__new__(Host)
+        executable = sys.executable
+        with mock.patch("host.shutil.which", return_value=None):
+            with self.assertRaises(PanelError) as context:
+                host.docker_command("ps")
+            self.assertEqual((context.exception.status, context.exception.code), (503, "docker_cli_missing"))
+
+        cases = (
+            ("permission denied while trying to connect to the docker API at unix:///var/run/docker.sock", 503, "docker_socket_permission"),
+            ("dial unix /var/run/docker.sock: connect: connection refused", 503, "docker_daemon_unavailable"),
+            ("Cannot connect to the Docker daemon. Is the docker daemon running?", 503, "docker_daemon_unavailable"),
+            ("Error response from daemon: permission denied opening container log file", 502, None),
+        )
+        with mock.patch("host.shutil.which", return_value=executable):
+            for diagnostic, status, code in cases:
+                with self.subTest(diagnostic=diagnostic):
+                    with self.assertRaises(PanelError) as context:
+                        host.docker_command("-c", f"raise SystemExit({diagnostic!r})")
+                    self.assertEqual((context.exception.status, context.exception.code), (status, code))
+                    if code is None:
+                        self.assertEqual(str(context.exception), diagnostic)
+
+    def test_container_replacement_recovers_when_docker_returns_empty_output(self):
+        host = Host.__new__(Host)
+        calls = []
+        responses = iter((
+            '[{"Name":"/web","State":{"Running":true}}]',
+            "",
+            "",
+            "",
+            "",
+            "",
+        ))
+
+        def docker_command(*arguments):
+            calls.append(arguments)
+            return next(responses)
+
+        config = {"name": "web", "image": "example:latest"}
+        with mock.patch.object(host, "docker_command", side_effect=docker_command):
+            with self.assertRaises(PanelError) as context:
+                host.update_container("a" * 64, config)
+        self.assertEqual(str(context.exception), "Docker returned an invalid replacement container ID.")
+        self.assertEqual(calls[-2:], [("rename", "harbor-backup-aaaaaaaaaaaa", "web"), ("start", "aaaaaaaa" * 8)])
+
+    def test_container_replacement_reports_recovery_failure(self):
+        host = Host.__new__(Host)
+        responses = iter(('[{"Name":"/web","State":{"Running":false}}]', "", "", ""))
+
+        def docker_command(*arguments):
+            if arguments == ("rename", "harbor-backup-aaaaaaaaaaaa", "web"):
+                raise PanelError("rename failed", 502)
+            return next(responses)
+
+        with mock.patch.object(host, "docker_command", side_effect=docker_command):
+            with self.assertRaises(PanelError) as context:
+                host.update_container("a" * 64, {"name": "web", "image": "example:latest"})
+        self.assertIn("Automatic recovery also failed: rename failed", str(context.exception))
+
+    def test_container_replacement_reports_backup_cleanup_failure(self):
+        host = Host.__new__(Host)
+        responses = iter(('[{"Name":"/web","State":{"Running":false}}]', "", "b" * 64))
+
+        def docker_command(*arguments):
+            if arguments == ("rm", "-f", "harbor-backup-aaaaaaaaaaaa"):
+                raise PanelError("backup is busy", 502)
+            return next(responses)
+
+        with mock.patch.object(host, "docker_command", side_effect=docker_command):
+            with self.assertRaises(PanelError) as context:
+                host.update_container("a" * 64, {"name": "web", "image": "example:latest"})
+        self.assertIn("New container " + "b" * 64 + " is running", str(context.exception))
+        self.assertIn("backup is busy", str(context.exception))
 
 
 if __name__ == "__main__":

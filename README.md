@@ -14,7 +14,7 @@
 | --- | --- |
 | 主机概览 | 真实 CPU、物理内存、文件根目录所在卷磁盘、全网卡吞吐、开机时间；2 秒采样，最多保留最近 90 点 |
 | 文件管理 | 浏览目录、新建目录、新建/编辑/上传 UTF-8 文本、下载文件；哈希版本冲突检查、编辑时原子替换 |
-| Docker | 读取当前 Docker context 的容器列表，启动/停止/重启，读取最近 150 行日志；操作前确认 |
+| Docker | 读取当前 Docker context 的容器列表，启动/停止/重启、读取日志并编辑配置；重建失败时自动尝试恢复旧容器 |
 | 诊断终端 | 预设只读命令、历史记录、结构化执行；不调用任意 Shell |
 | 进程监控 | 真实 PID、进程名称、所属用户、状态、RSS；按内存降序显示前 150 个可访问进程 |
 | 操作审计 | 登录、退出、文件变更、诊断和容器操作的请求及结果；SQLite 保留最近 10,000 条 |
@@ -169,6 +169,22 @@ location / {
 ```
 
 保持后端回环监听；通过防火墙限制管理入口。后端不信任 `X-Forwarded-For`，代理部署下审计来源及登录限速按代理地址统计。这里使用 Python 标准库 HTTP 服务，面向单管理员低并发场景，不建议作为直接暴露公网的大规模控制面。
+
+### Docker 权限（原生部署，可选）
+
+如果容器页提示「Docker 权限不足」，先确认宿主机已安装 Docker，且 `sudo docker info` 能成功连接。以下步骤仅适用于普通 Linux Docker 服务、且 socket 所属组为 `docker` 的情况，可用 `ls -l /var/run/docker.sock` 核实。
+
+**Docker socket 访问权限接近主机 root 权限。** 只在信任面板和管理员、且管理入口受防火墙或私有网络限制时授予。不要把 socket 改成全员可读写，也不要以 root 运行面板。
+
+- **systemd**：运行 `sudo systemctl edit harbor-panel`，填入下方配置，然后执行 `sudo systemctl restart harbor-panel`。独立的覆盖配置不会被菜单更新覆盖。
+- **Alpine / OpenRC**：执行 `sudo addgroup harbor docker`，再执行 `sudo rc-service harbor-panel restart`。若已是组成员，只需重启。
+
+```ini
+[Service]
+SupplementaryGroups=docker
+```
+
+完成后刷新容器页。要撤销授权，systemd 用 `sudo systemctl edit harbor-panel` 删除添加的 `SupplementaryGroups=docker` 配置（若覆盖文件只有这段配置，删除该覆盖文件后执行 `sudo systemctl daemon-reload`）；OpenRC 执行 `sudo delgroup harbor docker`。撤销后重启面板。若页面显示「无法连接 Docker 服务」，请先检查 Docker daemon 与面板使用的 Docker context，而不是扩大权限。
 
 ### 权限与边界
 

@@ -28,6 +28,16 @@ class Host:
         self.previous_network = psutil.net_io_counters()
         self.previous_time = time.monotonic()
         self.snapshot = {}
+        pids = psutil.pids()
+        self.process_snapshot = {
+            "processes": [
+                {"pid": pid, "name": "?", "user": "?", "status": "?", "memory": 0}
+                for pid in pids[:150]
+            ],
+            "total": len(pids),
+        }
+        self.process_snapshot_at = 0.0
+        self.process_lock = threading.Lock()
         self.sampler_error = None
         self.sample()
         self.thread = threading.Thread(target=self._sample_loop, name="harbor-metrics", daemon=True)
@@ -77,21 +87,31 @@ class Host:
             return {**self.snapshot, "history": list(self.history)}
 
     def processes(self):
-        rows = []
-        for process in psutil.process_iter(["pid", "name", "username", "status", "memory_info"]):
-            try:
-                info = process.info
-                memory = info["memory_info"]
-                rows.append({"pid": info["pid"], "name": info["name"] or "?", "user": info["username"] or "?", "status": info["status"], "memory": memory.rss if memory else 0})
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
-        rows.sort(key=lambda item: item["memory"], reverse=True)
-        return {"processes": rows[:150], "total": len(rows)}
+        now = time.monotonic()
+        if now - self.process_snapshot_at >= 2 and self.process_lock.acquire(blocking=False):
+            threading.Thread(target=self._refresh_processes, name="harbor-processes", daemon=True).start()
+        return {"processes": list(self.process_snapshot["processes"]), "total": self.process_snapshot["total"]}
+
+    def _refresh_processes(self):
+        try:
+            rows = []
+            for process in psutil.process_iter(["pid", "name", "status", "memory_info"]):
+                try:
+                    info = process.info
+                    memory = info["memory_info"]
+                    rows.append({"pid": info["pid"], "name": info["name"] or "?", "user": "?", "status": info["status"], "memory": memory.rss if memory else 0})
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+            rows.sort(key=lambda item: item["memory"], reverse=True)
+            self.process_snapshot = {"processes": rows[:150], "total": len(rows)}
+            self.process_snapshot_at = time.monotonic()
+        finally:
+            self.process_lock.release()
 
     def docker_command(self, *arguments):
         executable = shutil.which("docker")
         if not executable:
-            raise PanelError("Docker CLI is not installed on this host.", 503)
+            raise PanelError("Docker CLI is not installed on this host.", 503, code="docker_cli_missing")
         # Docker output may contain user-controlled logs; cap captured bytes as well as time.
         process = subprocess.Popen([executable, *arguments], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False)
         chunks = []
@@ -127,6 +147,14 @@ class Host:
         if too_large.is_set():
             raise PanelError("Docker output exceeded 1 MiB. Narrow the query.", 413)
         if process.returncode:
+            diagnostic = output.lower()
+            unix_socket = "unix://" in diagnostic or "dial unix " in diagnostic
+            if "permission denied" in diagnostic and unix_socket:
+                raise PanelError("The panel service cannot access the Docker socket.", 503, code="docker_socket_permission")
+            if "cannot connect to the docker daemon" in diagnostic or (
+                unix_socket and ("connection refused" in diagnostic or "no such file or directory" in diagnostic)
+            ):
+                raise PanelError("The Docker daemon is not reachable.", 503, code="docker_daemon_unavailable")
             raise PanelError(output[:2000] or "Docker command failed.", 502)
         return output
 
@@ -140,6 +168,107 @@ class Host:
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
                 raise PanelError("Docker returned an unsupported container response.", 502) from exc
         return {"containers": rows}
+
+    def container_config(self, container):
+        self.validate_container(container)
+        try:
+            item = json.loads(self.docker_command("inspect", container))[0]
+            config, host = item["Config"], item["HostConfig"]
+            ports = []
+            for key, bindings in (host.get("PortBindings") or {}).items():
+                container_port, protocol = key.split("/", 1)
+                for binding in bindings or []:
+                    ports.append(f"{binding.get('HostIp', '') + ':' if binding.get('HostIp') else ''}{binding['HostPort']}:{container_port}/{protocol}")
+            mounts = [f"{mount['Source']}:{mount['Destination']}" + (":ro" if not mount.get("RW", True) else "") for mount in item.get("Mounts", []) if mount.get("Type") in ("bind", "volume")]
+            return {"id": item["Id"], "state": item.get("State", {}).get("Status"), "config": {
+                "name": item.get("Name", "").lstrip("/"), "image": config.get("Image", ""),
+                "command": config.get("Cmd") or [], "ports": ports,
+                "environment": config.get("Env") or [], "volumes": mounts,
+                "networks": list((host.get("NetworkMode") or "default").split(",")) if host.get("NetworkMode") not in ("default", "bridge") else (["bridge"] if host.get("NetworkMode") == "bridge" else []),
+                "restart_policy": (host.get("RestartPolicy") or {}).get("Name") or "no",
+                "memory_limit": host.get("Memory", 0), "cpu_limit": round(host.get("NanoCpus", 0) / 1e9, 3),
+            }}
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError, ValueError) as exc:
+            raise PanelError("Docker returned an unsupported inspect response.", 502) from exc
+
+    @staticmethod
+    def validate_container_config(config):
+        if not isinstance(config, dict):
+            raise PanelError("Container configuration must be an object.")
+        name, image = config.get("name"), config.get("image")
+        if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", name):
+            raise PanelError("Container name is invalid.")
+        if not isinstance(image, str) or len(image) > 255 or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._/:@-]*", image):
+            raise PanelError("Container image is invalid.")
+        fields = ("command", "ports", "environment", "volumes", "networks")
+        if any(not isinstance(config.get(field, []), list) or len(config.get(field, [])) > 256 for field in fields):
+            raise PanelError("Container list fields must be arrays with at most 256 items.")
+        for value in config.get("command", []):
+            if not isinstance(value, str) or len(value) > 4096 or "\x00" in value:
+                raise PanelError("Container command arguments must be strings under 4096 characters.")
+        for field, pattern in (("ports", r"(?:[0-9.]+:)?[0-9]{1,5}:[0-9]{1,5}(?:/(?:tcp|udp|sctp))?"), ("volumes", r"[^\x00:]+:[^\x00:]+(?::ro|:rw)?"), ("networks", r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}")):
+            for value in config.get(field, []):
+                if not isinstance(value, str) or len(value) > 4096 or not re.fullmatch(pattern, value):
+                    raise PanelError(f"Invalid container {field} entry.")
+                if field == "ports":
+                    port_parts = value.rsplit("/", 1)[0].split(":")[-2:]
+                    if any(int(port) > 65535 for port in port_parts):
+                        raise PanelError("Container ports must be between 0 and 65535.")
+        for value in config.get("environment", []):
+            if not isinstance(value, str) or len(value) > 8192 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", value):
+                raise PanelError("Environment entries must use KEY=value format.")
+        restart = config.get("restart_policy", "no")
+        if restart not in ("no", "always", "unless-stopped", "on-failure"):
+            raise PanelError("Unsupported restart policy.")
+        memory, cpu = config.get("memory_limit", 0), config.get("cpu_limit", 0)
+        if isinstance(memory, bool) or not isinstance(memory, int) or memory < 0 or memory > 2**50:
+            raise PanelError("Memory limit must be bytes between 0 and 1 PiB.")
+        if isinstance(cpu, bool) or not isinstance(cpu, (int, float)) or not 0 <= cpu <= 1024:
+            raise PanelError("CPU limit must be between 0 and 1024 cores.")
+        return {**config, "command": config.get("command", []), "ports": config.get("ports", []), "environment": config.get("environment", []), "volumes": config.get("volumes", []), "networks": config.get("networks", []), "restart_policy": restart, "memory_limit": memory, "cpu_limit": cpu}
+
+    def update_container(self, container, config):
+        self.validate_container(container)
+        config = self.validate_container_config(config)
+        inspected = json.loads(self.docker_command("inspect", container))[0]
+        current_name = inspected.get("Name", "").lstrip("/")
+        if config["name"] != current_name:
+            existing = self.docker_command("ps", "-a", "--filter", f"name=^{re.escape(config['name'])}$", "--format", "{{.ID}}")
+            if existing:
+                raise PanelError("A container with this name already exists.", 409)
+        backup = f"harbor-backup-{container[:12]}"
+        was_running = inspected.get("State", {}).get("Running", False)
+        if was_running:
+            self.docker_command("stop", "--time", "10", container)
+        self.docker_command("rename", container, backup)
+        args = ["run", "-d", "--name", config["name"], "--restart", config["restart_policy"]]
+        if config["memory_limit"]:
+            args.extend(("--memory", str(config["memory_limit"])))
+        if config["cpu_limit"]:
+            args.extend(("--cpus", str(config["cpu_limit"])))
+        for item in config["ports"]: args.extend(("-p", item))
+        for item in config["environment"]: args.extend(("-e", item))
+        for item in config["volumes"]: args.extend(("-v", item))
+        for item in config["networks"]: args.extend(("--network", item))
+        args.append(config["image"])
+        args.extend(config["command"])
+        try:
+            output = self.docker_command(*args)
+            new_id = output.strip().splitlines()[0] if output.strip() else ""
+            if not re.fullmatch(r"[a-f0-9]{12,64}", new_id):
+                raise PanelError("Docker returned an invalid replacement container ID.", 502)
+        except PanelError as exc:
+            try:
+                self.docker_command("rename", backup, current_name)
+                if was_running: self.docker_command("start", container)
+            except PanelError as recovery_error:
+                raise PanelError(f"Container replacement failed: {exc}. Automatic recovery also failed: {recovery_error}", 502) from exc
+            raise
+        try:
+            self.docker_command("rm", "-f", backup)
+        except PanelError as exc:
+            raise PanelError(f"New container {new_id} is running, but the old backup {backup} could not be removed: {exc}", 502) from exc
+        return {"id": new_id, "name": config["name"], "recreated": True}
 
     @staticmethod
     def validate_container(container):
