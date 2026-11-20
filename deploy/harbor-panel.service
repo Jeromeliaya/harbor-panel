@@ -7,7 +7,7 @@ Type=simple
 User=harbor
 Group=harbor
 WorkingDirectory=/opt/harbor-panel
-EnvironmentFile=/etc/harbor-panel.env
+EnvironmentFile=-/etc/harbor-panel.env
 Environment=HARBOR_PANEL_PORT=8088
 EnvironmentFile=-/etc/harbor-panel.port
 Environment=PYTHONDONTWRITEBYTECODE=1
