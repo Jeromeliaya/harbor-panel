@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">Harbor Panel 主机概览界面示意</title>
+  <desc id="desc">展示主机 CPU、内存、磁盘、网络采样曲线和快捷工作区的运维面板示意图，数据为虚构示例。</desc>
+  <defs>
+    <linearGradient id="hero" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#edf2e4"/><stop offset="1" stop-color="#dfe9d5"/></linearGradient>
+    <clipPath id="chartClip"><rect x="337" y="540" width="602" height="173" rx="3"/></clipPath>
+  </defs>
+  <rect width="1440" height="900" fill="#f5f6f8"/>
+  <rect width="224" height="900" fill="#172724"/>
+  <rect x="31" y="30" width="36" height="38" rx="10" fill="#c6efa5"/>
+  <text x="39" y="59" font-family="Arial,sans-serif" font-size="28" font-weight="700" fill="#20392a">H·</text>
+  <text x="78" y="57" font-family="Arial,sans-serif" font-size="23" font-weight="650" fill="#fff">harbor</text>
+  <text x="151" y="57" font-family="Arial,sans-serif" font-size="18" fill="#c0d0c7">panel</text>
+  <text x="34" y="127" font-family="Arial,sans-serif" font-size="11" letter-spacing="1.5" fill="#83958f">工作空间</text>
+  <g font-family="Arial,sans-serif" font-size="13">
+    <rect x="16" y="148" width="192" height="45" rx="8" fill="#c6efa5"/><text x="54" y="176" fill="#233d2f" font-weight="600">主机概览</text>
+    <text x="54" y="233" fill="#a4b6ad">文件管理</text><text x="54" y="283" fill="#a4b6ad">Docker 容器</text>
+    <text x="54" y="333" fill="#a4b6ad">诊断终端</text><text x="54" y="383" fill="#a4b6ad">进程监控</text>
+    <text x="54" y="433" fill="#a4b6ad">操作审计</text>
+  </g>
+  <g fill="none" stroke="#a4b6ad" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="30" y="160" width="14" height="14" rx="3"/><path d="M30 223h16v12H30zm0-5h7l3 5"/>
+    <path d="m38 265 12 7v11l-12 7-12-7v-11z"/><path d="M29 273l9 5 9-5m-9 5v12"/>
+    <rect x="28" y="317" width="18" height="15" rx="3"/><path d="m32 321 4 4-4 4m7 0h4"/>
+    <path d="M27 382h5l3-8 5 16 3-8h5"/><path d="m38 414 10 4v6c0 5-10 9-10 9s-10-4-10-9v-6z"/>
+  </g>
+  <line x1="18" y1="800" x2="206" y2="800" stroke="#2d3f37"/>
+  <circle cx="43" cy="833" r="17" fill="#263c31"/><path d="M35 834h16m-8-8v16" stroke="#b9e398" stroke-width="1.5"/>
+  <text x="70" y="831" font-family="Arial,sans-serif" font-size="12" fill="#fff">示例 Linux 主机</text><text x="70" y="850" font-family="Arial,sans-serif" font-size="10" fill="#829b8c">● 当前管理节点</text>
+  <rect x="224" width="1216" height="77" fill="#fff"/><line x1="224" y1="77" x2="1440" y2="77" stroke="#e9eeeb"/>
+  <text x="263" y="45" font-family="Arial,sans-serif" font-size="12" fill="#9aa39e">工作空间</text><text x="337" y="45" font-family="Arial,sans-serif" font-size="12" fill="#d7ddd8">/</text><text x="355" y="45" font-family="Arial,sans-serif" font-size="12" fill="#46554b">主机概览</text>
+  <rect x="1080" y="23" width="206" height="34" rx="7" fill="#f7f9f7"/><text x="1094" y="45" font-family="Arial,sans-serif" font-size="11" fill="#9aa59d">⌕　快速前往…</text><rect x="1219" y="32" width="48" height="17" rx="4" fill="#fff" stroke="#e6eae7"/><text x="1227" y="44" font-family="Arial,sans-serif" font-size="9" fill="#87908a">Ctrl K</text>
+  <circle cx="1322" cy="40" r="15" fill="#e4ede6"/><text x="1318" y="45" font-family="Arial,sans-serif" font-size="12" fill="#58705e">A</text><text x="1345" y="44" font-family="Arial,sans-serif" font-size="11" fill="#68776b">管理员</text>
+  <text x="263" y="132" font-family="Arial,sans-serif" font-size="10" letter-spacing="2" font-weight="600" fill="#278269">WORKSPACE OVERVIEW</text>
+  <text x="263" y="174" font-family="Arial,sans-serif" font-size="29" font-weight="600" fill="#202b2b">主机概览</text><text x="263" y="200" font-family="Arial,sans-serif" font-size="12" fill="#84908e">一切尽在掌握，开始今天的运维。</text>
+  <circle cx="1254" cy="170" r="4" fill="#3e8864"/><text x="1265" y="174" font-family="Arial,sans-serif" font-size="11" fill="#3e8864">实时连接</text>
+  <rect x="1330" y="151" width="78" height="37" rx="8" fill="#fff" stroke="#e1e7e3"/><text x="1347" y="174" font-family="Arial,sans-serif" font-size="11" fill="#46554b">⟳ 刷新</text>
+  <rect x="263" y="224" width="1145" height="155" rx="14" fill="url(#hero)" stroke="#dde8d1"/>
+  <text x="294" y="258" font-family="Arial,sans-serif" font-size="10" letter-spacing="1.8" fill="#748467">HOST HEALTH · LIVE SAMPLE</text>
+  <text x="294" y="298" font-family="Arial,sans-serif" font-size="24" font-weight="600" fill="#334632">主机状态，一目了然。</text>
+  <text x="294" y="326" font-family="Arial,sans-serif" font-size="12" fill="#7b876e">实时查看资源使用、网络吞吐与运行情况。</text>
+  <text x="294" y="356" font-family="Arial,sans-serif" font-size="11" fill="#637357">● 低延迟采样　　▣ 本机数据　　✓ 安全管理</text>
+  <g font-family="Arial,sans-serif">
+    <g><rect x="263" y="398" width="273" height="118" rx="12" fill="#fff" stroke="#e9eeeb"/><text x="284" y="427" font-size="12" fill="#879489">CPU 使用率</text><text x="284" y="469" font-size="30" font-weight="600" fill="#202b2b">24.8<tspan font-size="14" fill="#94a091">%</tspan></text><text x="284" y="497" font-size="10" fill="#718674">8 核心　·　示例采样</text><circle cx="500" cy="420" r="14" fill="#eef5ee"/><text x="493" y="425" font-size="13" fill="#648975">⌁</text></g>
+    <g><rect x="553" y="398" width="273" height="118" rx="12" fill="#fff" stroke="#e9eeeb"/><text x="574" y="427" font-size="12" fill="#879489">物理内存</text><text x="574" y="469" font-size="30" font-weight="600" fill="#202b2b">6.2<tspan font-size="14" fill="#94a091"> GB</tspan></text><text x="574" y="497" font-size="10" fill="#718674">共 16 GB　·　示例采样</text><circle cx="790" cy="420" r="14" fill="#f0eef8"/><text x="784" y="425" font-size="12" fill="#8c82b0">▤</text></g>
+    <g><rect x="843" y="398" width="273" height="118" rx="12" fill="#fff" stroke="#e9eeeb"/><text x="864" y="427" font-size="12" fill="#879489">磁盘使用</text><text x="864" y="469" font-size="30" font-weight="600" fill="#202b2b">42<tspan font-size="14" fill="#94a091">%</tspan></text><text x="864" y="497" font-size="10" fill="#718674">根卷　·　示例采样</text><circle cx="1080" cy="420" r="14" fill="#faf3e5"/><text x="1075" y="425" font-size="12" fill="#b69b62">▱</text></g>
+    <g><rect x="1133" y="398" width="275" height="118" rx="12" fill="#fff" stroke="#e9eeeb"/><text x="1154" y="427" font-size="12" fill="#879489">网络吞吐</text><text x="1154" y="465" font-size="23" font-weight="600" fill="#202b2b">↓ 1.8 <tspan font-size="12" fill="#94a091">MB/s</tspan></text><text x="1154" y="495" font-size="12" fill="#7795a4">↑ 640 <tspan font-size="10">KB/s　·　示例采样</tspan></text><circle cx="1370" cy="420" r="14" fill="#eaf2f8"/><text x="1364" y="425" font-size="12" fill="#7c9fb9">↕</text></g>
+  </g>
+  <rect x="263" y="536" width="704" height="268" rx="12" fill="#fff" stroke="#e9eeeb"/>
+  <text x="286" y="568" font-family="Arial,sans-serif" font-size="14" font-weight="600" fill="#202b2b">资源使用趋势</text>
+  <text x="286" y="588" font-family="Arial,sans-serif" font-size="10" fill="#84908e">最近采样　·　示意数据</text>
+  <circle cx="789" cy="563" r="4" fill="#66a288"/><text x="799" y="567" font-family="Arial,sans-serif" font-size="10" fill="#8c998f">CPU</text><circle cx="849" cy="563" r="4" fill="#b4abd0"/><text x="859" y="567" font-family="Arial,sans-serif" font-size="10" fill="#8c998f">内存</text>
+  <g stroke="#eef1ed" stroke-dasharray="3 5"><path d="M305 622h630M305 662h630M305 702h630M305 742h630"/></g>
+  <g clip-path="url(#chartClip)" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M305 689 C340 681 351 651 385 661 S430 681 459 650 502 664 531 642 575 650 603 631 645 648 675 632 715 649 745 625 789 637 820 616 858 628 885 602 913 618 943 596" stroke="#66a288" stroke-width="3"/><path d="M305 710 C337 704 361 708 385 695 S430 703 459 692 503 699 531 684 575 693 603 678 645 688 675 677 716 686 745 671 788 681 820 663 860 676 885 657 916 668 943 651" stroke="#b4abd0" stroke-width="3"/></g>
+  <g font-family="Arial,sans-serif" font-size="9" fill="#acb6ac"><text x="302" y="776">1m</text><text x="426" y="776">3m</text><text x="552" y="776">5m</text><text x="679" y="776">7m</text><text x="807" y="776">9m</text><text x="918" y="776">现在</text></g>
+  <rect x="987" y="536" width="421" height="268" rx="12" fill="#fff" stroke="#e9eeeb"/>
+  <text x="1011" y="568" font-family="Arial,sans-serif" font-size="14" font-weight="600" fill="#202b2b">快捷工作区</text>
+  <text x="1011" y="588" font-family="Arial,sans-serif" font-size="10" fill="#84908e">常用主机管理入口</text>
+  <g font-family="Arial,sans-serif">
+    <rect x="1011" y="610" width="175" height="68" rx="9" fill="#fff" stroke="#edf0e9"/><circle cx="1038" cy="644" r="15" fill="#eef5ee"/><text x="1062" y="640" font-size="12" font-weight="600" fill="#425541">文件管理</text><text x="1062" y="658" font-size="9" fill="#a1aa9d">浏览与编辑文件</text>
+    <rect x="1200" y="610" width="184" height="68" rx="9" fill="#fff" stroke="#edf0e9"/><circle cx="1227" cy="644" r="15" fill="#f0eef8"/><text x="1251" y="640" font-size="12" font-weight="600" fill="#425541">Docker 容器</text><text x="1251" y="658" font-size="9" fill="#a1aa9d">管理容器与日志</text>
+    <rect x="1011" y="692" width="175" height="68" rx="9" fill="#fff" stroke="#edf0e9"/><circle cx="1038" cy="726" r="15" fill="#faf3e5"/><text x="1062" y="722" font-size="12" font-weight="600" fill="#425541">诊断终端</text><text x="1062" y="740" font-size="9" fill="#a1aa9d">预设只读命令</text>
+    <rect x="1200" y="692" width="184" height="68" rx="9" fill="#fff" stroke="#edf0e9"/><circle cx="1227" cy="726" r="15" fill="#eaf2f8"/><text x="1251" y="722" font-size="12" font-weight="600" fill="#425541">进程监控</text><text x="1251" y="740" font-size="9" fill="#a1aa9d">查看资源占用</text>
+  </g>
+  <line x1="263" y1="841" x2="1408" y2="841" stroke="#e7ece8"/><text x="263" y="866" font-family="Arial,sans-serif" font-size="10" fill="#a6afa9">HARBOR PANEL　·　为日常运维留一点余裕</text><text x="1251" y="866" font-family="Arial,sans-serif" font-size="10" fill="#a6afa9">界面示意 · 数据为虚构示例</text>
+</svg>
