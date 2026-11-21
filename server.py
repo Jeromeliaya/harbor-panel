@@ -22,6 +22,8 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 from files import FileStore, PanelError
 from host import Host
+from appearance import AppearanceStore
+from terminal import TerminalManager
 
 
 BASE = Path(__file__).resolve().parent
@@ -135,6 +137,14 @@ class Auth:
         with self.lock:
             self.sessions.pop(token, None)
 
+    def has_session(self, token):
+        with self.lock:
+            session = self.sessions.get(token)
+            if not session or session["expires"] <= time.monotonic():
+                self.sessions.pop(token, None)
+                return False
+            return True
+
 
 class Audit:
     def __init__(self, directory):
@@ -168,10 +178,13 @@ class PanelServer(ThreadingHTTPServer):
             raise ValueError("The state directory must be outside the managed file root.")
         protected_paths = (state, bootstrap) if full_host and bootstrap else ((state,) if full_host else ())
         self.files = FileStore(file_root, protected_paths=protected_paths, allow_symlinks=full_host)
+        self.state_dir = state
         self.full_host = full_host
         self.full_host_root = full_host and hasattr(os, "geteuid") and os.geteuid() == 0
         self.auth = Auth(password if not bootstrap_token_file else None, bootstrap_token_file, state)
         self.audit = Audit(state)
+        self.appearance = AppearanceStore(state)
+        self.terminal = TerminalManager(state, native_root=self.full_host_root, audit=self.audit)
         self.workers = threading.BoundedSemaphore(32)
         super().__init__(address, Handler)
         port = self.server_address[1]
@@ -191,6 +204,11 @@ class PanelServer(ThreadingHTTPServer):
         except Exception:
             self.server_close()
             raise
+
+    def server_close(self):
+        if hasattr(self, "terminal"):
+            self.terminal.close_all()
+        super().server_close()
 
     def process_request(self, request, client_address):
         if not self.workers.acquire(blocking=False):
@@ -259,7 +277,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'")
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -341,7 +359,9 @@ class Handler(BaseHTTPRequestHandler):
                 except PanelError:
                     self.server.audit.add("login", "administrator", address, False)
                     raise
-                self.server.auth.logout(self._token())
+                previous_token = self._token()
+                self.server.auth.logout(previous_token)
+                self.server.terminal.close_owner(previous_token)
                 self.server.audit.add("login", "administrator", address)
                 self._respond(200, {"csrf": csrf}, headers={"Set-Cookie": self._cookie(token)})
                 return
@@ -360,6 +380,9 @@ class Handler(BaseHTTPRequestHandler):
                 session = self.server.auth.session(token)
                 if mutation and not hmac.compare_digest(self.headers.get("X-CSRF-Token", "").encode("utf-8"), session["csrf"].encode("ascii")):
                     raise PanelError("CSRF token is missing or invalid.", 403)
+                if path == "/api/terminal/ws" and self.command == "GET":
+                    self.server.terminal.serve(self, token, session, self.server.secure_cookie)
+                    return
                 if not mutation:
                     self._get_api(path, relative, query, session)
                 else:
@@ -367,12 +390,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if mutation:
                 raise PanelError("Route not found.", 404)
-            assets = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/style.css": "style.css", "/favicon.svg": "favicon.svg"}
+            assets = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/style.css": "style.css", "/favicon.svg": "favicon.svg", "/vendor/xterm.js": "vendor/xterm.js", "/vendor/xterm.css": "vendor/xterm.css", "/vendor/xterm-addon-fit.js": "vendor/xterm-addon-fit.js"}
             if path not in assets:
                 raise PanelError("Page not found.", 404)
             asset = BASE / "web" / assets[path]
             content_type = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
-            self._respond(200, asset.read_bytes(), content_type + "; charset=utf-8")
+            if content_type.startswith(("text/", "application/javascript")):
+                content_type += "; charset=utf-8"
+            self._respond(200, asset.read_bytes(), content_type)
         except PanelError as exc:
             error = {"error": str(exc)}
             if exc.code:
@@ -393,7 +418,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _get_api(self, path, relative, query, session):
         if path == "/api/session":
-            result = {"csrf": session["csrf"], "version": "0.1.0", "file_root": str(self.server.files.root), "platform": os.name, "commands": list(Host.COMMANDS), "full_host": self.server.full_host, "full_host_root": self.server.full_host_root, "public_http": self.server.public_bind and not self.server.secure_cookie}
+            result = {"csrf": session["csrf"], "version": "0.1.0", "file_root": str(self.server.files.root), "platform": os.name, "commands": list(Host.COMMANDS), "full_host": self.server.full_host, "full_host_root": self.server.full_host_root, "public_http": self.server.public_bind and not self.server.secure_cookie, "https_remote_ssh": self.server.secure_cookie}
+        elif path == "/api/appearance":
+            result = self.server.appearance.get()
+        elif path == "/api/appearance/background":
+            content_type, data = self.server.appearance.background()
+            self._respond(200, data, content_type, {"Content-Disposition": "inline"})
+            return
         elif path == "/api/metrics":
             result = self.server.host.metrics()
         elif path == "/api/processes":
@@ -419,10 +450,13 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(200, result)
 
     def _write_api(self, path, address, token):
-        routes = {("POST", "/api/logout"), ("POST", "/api/terminal"), ("POST", "/api/containers/action"), ("PUT", "/api/containers/config"), ("PUT", "/api/files/write"), ("POST", "/api/files/mkdir")}
+        routes = {("POST", "/api/logout"), ("POST", "/api/terminal"), ("POST", "/api/containers/action"), ("PUT", "/api/containers/config"), ("PUT", "/api/files/write"), ("POST", "/api/files/mkdir"), ("POST", "/api/appearance"), ("PUT", "/api/appearance/background"), ("POST", "/api/appearance/background/remove")}
         if (self.command, path) not in routes:
             raise PanelError("API route or method not found.", 404)
-        body = self._body()
+        if path == "/api/appearance/background" and self.command == "PUT":
+            body = {}
+        else:
+            body = self._body()
         target = body.get("path", body.get("id", body.get("command", "administrator")))
         action = path.removeprefix("/api/").replace("/", ".")
         if path == "/api/terminal" and self.server.full_host:
@@ -431,11 +465,18 @@ class Handler(BaseHTTPRequestHandler):
             target = f"{body.get('action', '')}:{body.get('id', '')}"
         elif path == "/api/containers/config":
             target = body.get("id", "")
+        elif path == "/api/appearance":
+            target = "panel theme"
+        elif path == "/api/appearance/background":
+            target = "panel background image"
+        elif path == "/api/appearance/background/remove":
+            target = "panel background image"
         # Record intent before changing resources, then record the result separately.
         self.server.audit.add(action + ".requested", target, address)
         try:
             if path == "/api/logout":
                 self.server.auth.logout(token)
+                self.server.terminal.close_owner(token)
                 result = {"ok": True}
             elif path == "/api/terminal":
                 result = self.server.host.terminal(body.get("command"))
@@ -445,6 +486,24 @@ class Handler(BaseHTTPRequestHandler):
                 if "id" not in body or "config" not in body:
                     raise PanelError("id and config are required.")
                 result = self.server.host.update_container(body["id"], body["config"])
+            elif path == "/api/appearance":
+                result = self.server.appearance.set_theme(body.get("theme"))
+            elif path == "/api/appearance/background":
+                content_type = self.headers.get("X-Image-Type", "")
+                if self.headers.get("Transfer-Encoding"):
+                    raise PanelError("Transfer-Encoding is not supported.")
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError as exc:
+                    raise PanelError("Invalid Content-Length.") from exc
+                if length < 0 or length > self.server.appearance.MAX_BACKGROUND:
+                    raise PanelError("Background images must be no larger than 1.5 MB (1,500,000 bytes).", 413)
+                image_data = self.rfile.read(length)
+                if len(image_data) != length:
+                    raise PanelError("Incomplete background image upload.")
+                result = self.server.appearance.set_background(content_type, image_data)
+            elif path == "/api/appearance/background/remove":
+                result = self.server.appearance.remove_background()
             elif path == "/api/files/write":
                 if "path" not in body or "content" not in body or "etag" not in body:
                     raise PanelError("path, content and etag are required (etag=null creates a file).")

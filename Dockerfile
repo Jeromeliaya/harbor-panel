@@ -12,7 +12,7 @@ RUN groupadd --gid 10001 harbor \
     && useradd --uid 10001 --gid harbor --no-create-home --shell /usr/sbin/nologin harbor \
     && install -d -o harbor -g harbor /data/workspace /data/state
 
-COPY server.py files.py host.py LICENSE ./
+COPY server.py files.py host.py appearance.py terminal.py local_ssh.py LICENSE ./
 COPY web/ ./web/
 
 USER 10001:10001

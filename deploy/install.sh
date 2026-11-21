@@ -85,16 +85,16 @@ fi
 case "${ID:-}:${ID_LIKE:-}" in
     debian:*|ubuntu:*|linuxmint:*|*:debian*)
         apt-get update
-        apt-get install -y python3 python3-pip python3-venv
+        apt-get install -y python3 python3-pip python3-venv openssh-server
         ;;
     alpine:*)
-        apk add --no-cache python3 py3-pip py3-virtualenv build-base linux-headers
+        apk add --no-cache python3 py3-pip py3-virtualenv build-base linux-headers openssh-server
         ;;
     rhel:*|centos:*|rocky:*|almalinux:*|fedora:*|*:rhel*|*:fedora*)
         if command -v dnf >/dev/null 2>&1; then
-            dnf install -y python3 python3-pip
+            dnf install -y python3 python3-pip openssh-server
         elif command -v yum >/dev/null 2>&1; then
-            yum install -y python3 python3-pip
+            yum install -y python3 python3-pip openssh-server
         else
             echo "Neither dnf nor yum is available on this RPM-based system." >&2
             exit 1

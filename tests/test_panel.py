@@ -15,6 +15,9 @@ import time
 import unittest
 from unittest import mock
 
+from wsproto import WSConnection, ConnectionType
+from wsproto.events import Request, AcceptConnection, TextMessage, CloseConnection
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from files import FileStore, PanelError
@@ -195,6 +198,77 @@ class HTTPTests(unittest.TestCase):
                 self.assertGreater(len(body), 20)
                 self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
         self.assertEqual(self.request("GET", "/server.py")[0], 404)
+
+    def test_appearance_routes_require_login_and_csrf(self):
+        self.assertEqual(self.request("GET", "/api/appearance")[0], 401)
+        self.login()
+        self.assertEqual(self.request("POST", "/api/appearance", {"theme": "nocturne"}, headers={"X-CSRF-Token": "wrong"})[0], 403)
+        self.assertEqual(self.request("POST", "/api/appearance", {"theme": "nocturne"})[1]["theme"], "nocturne")
+        self.assertEqual(self.request("POST", "/api/appearance", {"theme": "invalid"})[0], 400)
+        from test_terminal_appearance import image_bytes
+        self.assertEqual(self.request("PUT", "/api/appearance/background", raw=image_bytes(), headers={"X-Image-Type": "image/png"})[0], 200)
+        status, data, headers = self.request("GET", "/api/appearance/background")
+        self.assertEqual(status, 200)
+        self.assertTrue(data.startswith(b"\x89PNG"))
+        self.assertIn("no-store", headers["Cache-Control"])
+        self.assertEqual(self.request("POST", "/api/appearance/background/remove", {})[0], 200)
+        self.assertEqual(self.request("GET", "/api/appearance/background")[0], 404)
+
+    def test_websocket_rejects_unauthenticated_or_invalid_csrf(self):
+        upgrade = {"Connection": "Upgrade", "Upgrade": "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Protocol": "wrong"}
+        self.assertEqual(self.request("GET", "/api/terminal/ws", headers=upgrade)[0], 401)
+        self.login()
+        self.assertEqual(self.request("GET", "/api/terminal/ws", headers=upgrade)[0], 403)
+        upgrade["Sec-WebSocket-Protocol"] = self.csrf
+        upgrade["Origin"] = "https://untrusted.example"
+        self.assertEqual(self.request("GET", "/api/terminal/ws", headers=upgrade)[0], 403)
+
+    def test_websocket_fragmented_control_limit_and_logout(self):
+        self.login()
+        def open_socket():
+            connection = socket.create_connection(("127.0.0.1", self.port), timeout=4)
+            self.addCleanup(connection.close)
+            protocol = WSConnection(ConnectionType.CLIENT)
+            connection.sendall(protocol.send(Request(host=f"127.0.0.1:{self.port}", target="/api/terminal/ws", subprotocols=[self.csrf], extra_headers=[(b"origin", self.origin.encode()), (b"cookie", self.cookie.encode())])))
+            events = []
+            while not events:
+                protocol.receive_data(connection.recv(65536))
+                events.extend(protocol.events())
+            self.assertIsInstance(events[0], AcceptConnection)
+            return connection, protocol
+        def receive(connection, protocol):
+            events = []
+            while not events:
+                data = connection.recv(65536)
+                protocol.receive_data(data or None)
+                events.extend(protocol.events())
+            return events
+        connection, protocol = open_socket()
+        connection.sendall(protocol.send(TextMessage(data='{"type":"connect","target":', message_finished=False)))
+        connection.sendall(protocol.send(TextMessage(data='"remote","host":"example.com","password":"secret"}')))
+        events = receive(connection, protocol)
+        self.assertIn("HTTPS", json.loads(events[0].data)["message"])
+        connection.sendall(protocol.send(TextMessage(data="x" * 10000, message_finished=False)))
+        connection.sendall(protocol.send(TextMessage(data="x" * 10000)))
+        events = receive(connection, protocol)
+        self.assertTrue(any(isinstance(event, TextMessage) and "size limit" in event.data for event in events))
+        connection, protocol = open_socket()
+        with self.server.terminal.lock:
+            session = next(item for item in self.server.terminal.sessions.values() if item.peer.connection.getpeername()[1] == connection.getsockname()[1])
+        closed = threading.Event()
+        channel, client = mock.Mock(), mock.Mock()
+        channel.recv_ready.return_value = False
+        channel.closed = False
+        client.close.side_effect = closed.set
+        with session.lock:
+            session.channel, session.client = channel, client
+        connection.sendall(protocol.send(CloseConnection(code=1000, reason="leaving terminal")))
+        self.assertTrue(closed.wait(3), "Browser close must also close SSH")
+        channel.close.assert_called_once()
+        connection, protocol = open_socket()
+        self.assertEqual(self.request("POST", "/api/logout", {})[0], 200)
+        events = receive(connection, protocol)
+        self.assertTrue(any(isinstance(event, CloseConnection) for event in events))
 
     def test_session_cookie_logout_and_expiration(self):
         headers = self.login()

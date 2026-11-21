@@ -7,16 +7,47 @@ const views = {
   overview: { title: "主机概览", kicker: "WORKSPACE OVERVIEW", description: "一切尽在掌握，开始今天的运维。", icon: "grid" },
   files: { title: "文件管理", kicker: "FILE WORKSPACE", description: "浏览、创建和编辑文件，让每一份配置各就其位。", icon: "folder" },
   containers: { title: "Docker 容器", kicker: "CONTAINER MANAGEMENT", description: "连接本机 Docker，管理容器生命周期与日志。", icon: "box" },
-  terminal: { title: "诊断终端", kicker: "HOST DIAGNOSTICS", description: "用熟悉的命令，快速了解主机的真实状态。", icon: "terminal" },
+  terminal: { title: "终端", kicker: "INTERACTIVE SSH", description: "通过 SSH 直接操作本机 VPS，或安全连接其他服务器。", icon: "terminal" },
   processes: { title: "进程监控", kicker: "PROCESS MONITOR", description: "查看正在运行的进程，按内存占用排序。", icon: "activity" },
   audit: { title: "操作审计", kicker: "ACTIVITY & AUDIT", description: "每一次登录与管理操作，都有迹可循。", icon: "shield" },
+  appearance: { title: "外观主题", kicker: "YOUR VISUAL SPACE", description: "选择有纹理的配色主题，也可以上传自己的背景图片。", icon: "sun" },
   info: { title: "主机信息", kicker: "HOST INFORMATION", description: "了解当前环境、运行配置与工作台能力。", icon: "server" },
 };
-const state = { csrf: "", session: null, metrics: null, audit: [], view: "overview", generation: 0, path: "", entries: [], containers: [], processes: [], filter: "", editor: null, commands: [], historyIndex: 0, terminal: "Harbor diagnostics · 输入 help 查看可用命令。\n这是诊断命令工作区，不提供交互式 Shell。\n\n", polling: false, refreshing: false };
+const state = { csrf: "", session: null, appearance: { theme: "botanical", has_background: false }, metrics: null, audit: [], view: "overview", generation: 0, path: "", entries: [], containers: [], processes: [], filter: "", editor: null, polling: false, refreshing: false };
 let toastTimer;
 let filesRequest = 0;
 let editorRequest = 0;
-let terminalBusy = false;
+let terminalEmulator = null;
+let terminalFit = null;
+let terminalSocket = null;
+let terminalResizeObserver = null;
+let terminalConnectRequest = null;
+let appearanceBusy = false;
+
+function disposeTerminal() {
+  if (terminalResizeObserver) terminalResizeObserver.disconnect();
+  terminalResizeObserver = null;
+  if (terminalSocket) {
+    terminalSocket.onopen = null;
+    terminalSocket.onmessage = null;
+    terminalSocket.onclose = null;
+    terminalSocket.onerror = null;
+    terminalSocket.close(1000, "Terminal view closed");
+  }
+  terminalSocket = null;
+  terminalConnectRequest = null;
+  if (terminalEmulator) terminalEmulator.dispose();
+  terminalEmulator = null;
+  terminalFit = null;
+}
+
+function applyAppearance() {
+  document.documentElement.dataset.theme = state.appearance.theme || "botanical";
+  const image = state.appearance.has_background
+    ? `url("/api/appearance/background?v=${Date.now()}")`
+    : "none";
+  document.documentElement.style.setProperty("--wallpaper-image", image);
+}
 
 function bytes(value, digits = 1) {
   let number = Number(value) || 0;
@@ -46,8 +77,11 @@ function toast(message, error = false) {
 }
 
 function showLogin() {
+  disposeTerminal();
   state.csrf = "";
   state.session = null;
+  state.appearance = { theme: "botanical", has_background: false };
+  applyAppearance();
   state.generation++;
   state.editor = null;
   state.metrics = null;
@@ -55,8 +89,6 @@ function showLogin() {
   state.containers = [];
   state.processes = [];
   state.audit = [];
-  state.commands = [];
-  state.terminal = "Harbor diagnostics · 输入 help 查看可用命令。\n这是诊断命令工作区，不提供交互式 Shell。\n\n";
   $("editor-content").value = "";
   $("output-content").textContent = "";
   $("app").hidden = true;
@@ -139,7 +171,9 @@ function viewError(error) {
 async function navigate() {
   if (!state.session) return;
   const requested = location.hash.slice(1);
-  state.view = Object.hasOwn(views, requested) ? requested : "overview";
+  const nextView = Object.hasOwn(views, requested) ? requested : "overview";
+  if (state.view === "terminal") disposeTerminal();
+  state.view = nextView;
   const view = views[state.view];
   const generation = ++state.generation;
   $("page-title").textContent = view.title;
@@ -153,6 +187,7 @@ async function navigate() {
     else item.removeAttribute("aria-current");
   });
   closeNav();
+  $("view").setAttribute("aria-live", state.view === "terminal" ? "off" : "polite");
   $("view").innerHTML = '<div class="loading">正在读取主机数据…</div>';
   try {
     if (state.view === "overview") {
@@ -170,6 +205,12 @@ async function navigate() {
       renderContainers();
     } else if (state.view === "terminal") {
       renderTerminal();
+    } else if (state.view === "appearance") {
+      const appearance = await api("appearance");
+      if (generation !== state.generation) return;
+      if (!appearanceBusy) state.appearance = appearance;
+      applyAppearance();
+      renderAppearance();
     } else if (state.view === "processes") {
       const data = await api("processes");
       if (generation !== state.generation) return;
@@ -215,7 +256,7 @@ function renderOverview() {
   $("view").innerHTML = `<section class="hero"><div class="hero-copy"><p class="eyebrow">A GOOD DAY TO KEEP THINGS RUNNING</p><h2>让每一台服务器，都井然有序。</h2><p>欢迎回到你的工作台。${escapeHTML(m.hostname)} 的运行状态，正在实时同步。</p><div class="hero-pills"><span>${icon("server")}${escapeHTML(m.platform)} · ${m.cpu_count} 核心</span><span>${icon("clock")}已运行 ${duration(m.uptime)}</span><span>${icon("shield")}管理员会话已验证</span></div></div><div class="hero-illustration" aria-hidden="true"><svg viewBox="0 0 190 150" fill="none"><ellipse cx="94" cy="132" rx="75" ry="8" fill="#b7cba5" opacity=".35"/><path d="m44 27 65-13 48 22-64 14-49-23Z" fill="#d9e7c8" stroke="#9fb38b"/><path d="M44 27v26l49 23V50L44 27Z" fill="#c4d7b0" stroke="#9fb38b"/><path d="m93 50 64-14v26L93 76V50Z" fill="#eff4e3" stroke="#9fb38b"/><path d="m44 67 49 23 64-14v26l-64 14-49-23V67Z" fill="#d6e4c5" stroke="#9fb38b"/><path d="m44 67 16-4 33 16 47-10 17 7-64 14-49-23Z" fill="#e5edda" stroke="#9fb38b"/><path d="M93 90v26m-37-34 22 10m-22-51 22 10" stroke="#9db288"/><circle cx="144" cy="51" r="3" fill="#7d9c64"/><circle cx="143" cy="92" r="3" fill="#7d9c64"/><path d="M26 125V98m0 14c-13-1-16-12-16-12s14-1 16 12Zm0-7c12-1 13-14 13-14s-13 2-13 14Z" stroke="#83a06e" stroke-width="2"/><path d="m159 16 5-7m-14 6-2-8m16 17 8-1" stroke="#b2c499" stroke-width="2"/></svg></div></section>
     <div class="stats-grid">${statCard("CPU 使用率", "cpu", m.cpu_percent.toFixed(1), "%", `${m.cpu_count} 个逻辑核心`, m.cpu_percent > 85 ? "负载较高" : "实时采样", m.cpu_percent)}${statCard("内存使用率", "memory", m.memory.percent.toFixed(1), "%", `${bytes(m.memory.used)} / ${bytes(m.memory.total)}`, "物理内存", m.memory.percent)}${statCard("磁盘使用率", "disk", m.disk.percent.toFixed(1), "%", `已用 ${bytes(m.disk.used)}`, `共 ${bytes(m.disk.total)}`, m.disk.percent)}<section class="panel stat-card"><div class="stat-top"><span class="stat-title">实时网络速率</span><span class="stat-symbol">${icon("network")}</span></div><div class="stat-value">${rateParts[0]}<small>${rateParts[1]}/s</small></div><div class="stat-meta"><span>所有网卡累计吞吐</span><strong>↑↓ 实时</strong></div><div class="net-mini"><span>↓ ${bytes(m.network.received)}/s</span><span>↑ ${bytes(m.network.sent)}/s</span></div></section></div>
     <div class="dashboard-grid"><section class="panel"><div class="panel-heading"><div><h2>资源使用趋势</h2><p>当前会话 · 最多保留最近 3 分钟采样</p></div><div class="legend"><span><i></i>CPU</span><span><i class="memory-key"></i>内存</span></div></div><div class="chart-wrap">${chart(m.history)}</div></section><section class="panel"><div class="panel-heading"><h2>主机信息</h2><a class="button ghost small" href="#info">详情 ${icon("arrow")}</a></div><dl class="host-details">${detail("主机名称", m.hostname, true)}${detail("操作系统", `${m.platform} ${m.release}`)}${detail("系统架构", m.architecture)}${detail("逻辑核心", `${m.cpu_count} cores`)}${detail("开机时间", timestamp(Date.now() / 1000 - m.uptime))}${detail("文件卷剩余", bytes(m.disk.free))}</dl></section></div>
-    <div class="overview-bottom"><section class="panel quick-panel"><div class="panel-heading"><div><h2>常用工作区</h2><p>从这里，继续你的日常工作。</p></div>${icon("grid")}</div><div class="shortcut-grid">${["files", "terminal", "containers", "processes"].map((key) => `<a class="shortcut" href="#${key}">${icon(views[key].icon)}<span><strong>${views[key].title}</strong><small>${{ files: "浏览和编辑文件", terminal: "快速诊断主机", containers: "查看与管理容器", processes: "了解资源占用" }[key]}</small></span>${icon("arrow", "arrow")}</a>`).join("")}</div></section><section class="panel"><div class="panel-heading"><h2>最近活动</h2><a class="button ghost small" href="#audit">全部 ${icon("arrow")}</a></div><div class="audit-list">${state.audit.filter((event) => !event.action.endsWith(".requested")).slice(0, 4).map((event) => `<div class="audit-row">${icon(event.success ? "shield" : "activity")}<span class="audit-name">${escapeHTML(auditName(event.action))}</span><time>${new Date(event.time * 1000).toLocaleTimeString("zh-CN", { hour12: false })}</time></div>`).join("") || '<p class="muted">还没有操作记录。</p>'}</div></section></div>`;
+    <div class="overview-bottom"><section class="panel quick-panel"><div class="panel-heading"><div><h2>常用工作区</h2><p>从这里，继续你的日常工作。</p></div>${icon("grid")}</div><div class="shortcut-grid">${["files", "terminal", "containers", "processes"].map((key) => `<a class="shortcut" href="#${key}">${icon(views[key].icon)}<span><strong>${views[key].title}</strong><small>${{ files: "浏览和编辑文件", terminal: "打开 SSH 终端", containers: "查看与管理容器", processes: "了解资源占用" }[key]}</small></span>${icon("arrow", "arrow")}</a>`).join("")}</div></section><section class="panel"><div class="panel-heading"><h2>最近活动</h2><a class="button ghost small" href="#audit">全部 ${icon("arrow")}</a></div><div class="audit-list">${state.audit.filter((event) => !event.action.endsWith(".requested")).slice(0, 4).map((event) => `<div class="audit-row">${icon(event.success ? "shield" : "activity")}<span class="audit-name">${escapeHTML(auditName(event.action))}</span><time>${new Date(event.time * 1000).toLocaleTimeString("zh-CN", { hour12: false })}</time></div>`).join("") || '<p class="muted">还没有操作记录。</p>'}</div></section></div>`;
   if (focusedHref) [...$("view").querySelectorAll("a")].find((link) => link.getAttribute("href") === focusedHref)?.focus({ preventScroll: true });
 }
 
@@ -378,45 +419,148 @@ async function containerAction(index, action, button) {
   finally { button.disabled = false; }
 }
 
+function terminalStatus(text, error = false) {
+  const status = $("terminal-status");
+  if (!status) return;
+  status.textContent = text;
+  status.classList.toggle("is-error", error);
+}
+
+function terminalControl(message) {
+  if (terminalSocket?.readyState === WebSocket.OPEN) terminalSocket.send(JSON.stringify(message));
+}
+
+function sendTerminalConnect(request) {
+  if (!terminalSocket || terminalSocket.readyState !== WebSocket.OPEN || !request) return;
+  const dimensions = terminalFit?.proposeDimensions() || { cols: 100, rows: 28 };
+  terminalControl({ type: "connect", ...request, ...dimensions });
+  terminalConnectRequest = null;
+  if (request.target === "remote") { request.password = null; if ($("remote-password")) $("remote-password").value = ""; }
+  terminalStatus(request.target === "local" ? "正在连接本机 SSH…" : `正在连接 ${request.host}…`);
+}
+
+function connectTerminal(target, remote = null) {
+  if (state.view !== "terminal" || !terminalEmulator) return;
+  terminalConnectRequest = target === "local" ? { target: "local" } : { target: "remote", ...remote };
+  if (terminalSocket?.readyState === WebSocket.OPEN) {
+    sendTerminalConnect(terminalConnectRequest);
+    return;
+  }
+  if (terminalSocket && terminalSocket.readyState === WebSocket.CONNECTING) return;
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${scheme}//${location.host}/api/terminal/ws`, [state.csrf]);
+  const emulator = terminalEmulator;
+  terminalSocket = socket;
+  const current = () => terminalSocket === socket && terminalEmulator === emulator;
+  socket.binaryType = "arraybuffer";
+  socket.onopen = () => { if (current()) sendTerminalConnect(terminalConnectRequest); };
+  socket.onmessage = (event) => {
+    if (!current()) return;
+    if (typeof event.data !== "string") {
+      if (terminalEmulator) terminalEmulator.write(new Uint8Array(event.data));
+      return;
+    }
+    let message;
+    try { message = JSON.parse(event.data); }
+    catch { terminalStatus("收到无效的终端控制消息。", true); return; }
+    if (message.type === "host_key") {
+      const accepted = window.confirm(`首次连接 SSH 主机 ${message.host}（${message.key_type}）\n指纹：${message.fingerprint}\n\n请通过 VPS 控制台或其他可信渠道核对指纹。仅在确认匹配后继续。`);
+      terminalControl({ type: "host_key", challenge: message.challenge, accepted });
+    } else if (message.type === "connected") {
+      terminalStatus(`已连接 ${message.username}@${message.host}`);
+      terminalEmulator?.focus();
+    } else if (message.type === "error") {
+      terminalStatus(message.message || "SSH 连接失败。", true);
+      terminalEmulator?.write(`\r\n\x1b[31m${message.message || "SSH 连接失败。"}\x1b[0m\r\n`);
+    } else if (message.type === "disconnected") {
+      terminalStatus(message.message || "SSH 已断开。");
+      terminalEmulator?.write(`\r\n\x1b[90m${message.message || "SSH 已断开。"}\x1b[0m\r\n`);
+    }
+  };
+  socket.onerror = () => { if (current()) terminalStatus("WebSocket 连接失败，请检查面板地址和代理配置。", true); };
+  socket.onclose = (event) => {
+    if (!current()) return;
+    terminalConnectRequest = null;
+    terminalStatus(event.reason || "终端连接已关闭。", event.code !== 1000);
+  };
+}
+
+function terminalInput(data) {
+  if (terminalSocket?.readyState !== WebSocket.OPEN) return;
+  for (let offset = 0; offset < data.length; offset += 16384) terminalSocket.send(data.subarray(offset, offset + 16384));
+}
+
 function renderTerminal() {
-  $("view").innerHTML = `<div class="terminal-layout"><section class="terminal-window"><div class="terminal-titlebar"><span class="terminal-dots"><i></i><i></i><i></i></span><span>diagnostics @ ${escapeHTML(state.metrics?.hostname || "localhost")}</span><span>只读诊断</span></div><pre id="terminal-output" role="log" aria-label="诊断输出" tabindex="0"></pre><form id="terminal-form" class="terminal-input"><label for="terminal-command">❯</label><input id="terminal-command" autocomplete="off" spellcheck="false" placeholder="输入命令，例如 uptime"><button class="button primary small" type="submit">执行</button></form></section><aside class="panel terminal-help"><h3>常用诊断命令</h3><p>点击命令即可执行。这里只运行预设诊断，不支持 Shell、管道、脚本或系统修改。</p><div class="commands">${["help", "hostname", "whoami", "uptime", "df -h", "free -h", "ps", "docker ps"].map((command) => `<button class="command-chip" data-command="${command}">${command}<span>↵</span></button>`).join("")}</div><p>使用 ↑ / ↓ 查看本次会话的命令历史。</p></aside></div>`;
-  $("terminal-output").textContent = state.terminal;
-  $("terminal-output").scrollTop = $("terminal-output").scrollHeight;
-  if (state.session?.full_host) {
-    const root = state.session.full_host_root;
-    document.querySelector(".terminal-titlebar span:last-child").textContent = root ? "root 权限 Shell" : "全主机 Shell";
-    $("terminal-command").placeholder = root ? "输入主机命令（root 权限）" : "输入主机命令（服务账户权限）";
-    document.querySelector(".terminal-help p").textContent = `命令以${root ? "root" : "面板服务账户"}身份在 VPS 执行，可修改或删除该账户有权限访问的文件、服务和数据。每条命令最多运行 30 秒，输出上限 1 MiB。请谨慎操作。`;
+  const remoteAllowed = Boolean(state.session?.https_remote_ssh);
+  $("view").innerHTML = `<div class="terminal-layout"><section class="terminal-window"><div class="terminal-titlebar"><span class="terminal-dots"><i></i><i></i><i></i></span><span class="terminal-title">SSH · ${escapeHTML(state.metrics?.hostname || "本机")}</span><span id="terminal-status" role="status">准备连接本机 SSH…</span></div><div id="terminal-emulator" class="terminal-emulator" role="application" aria-label="SSH 交互终端"></div><div class="terminal-toolbar"><button class="button secondary small" data-terminal-action="local">连接本机</button><button class="button secondary small" data-terminal-action="disconnect">断开 SSH</button></div></section><aside class="panel terminal-help"><h2>连接其他 VPS</h2><p>远程连接使用 SSH root 用户和密码，不会保存密码。首次连接会显示主机指纹；请在可信渠道核实后再接受。</p><form id="remote-ssh-form" class="remote-ssh-form"><label for="remote-host">主机名或公网 IP</label><input id="remote-host" required maxlength="253" autocomplete="url" placeholder="例如 203.0.113.10"><label for="remote-port">SSH 端口</label><input id="remote-port" type="number" min="1" max="65535" value="22" required><label for="remote-user">SSH 用户</label><input id="remote-user" value="root" readonly aria-readonly="true"><label for="remote-password">root 密码</label><input id="remote-password" type="password" autocomplete="current-password" required maxlength="1024" ${remoteAllowed ? "" : "disabled"}><button class="button primary" type="submit" ${remoteAllowed ? "" : "disabled"}>连接远程 VPS</button></form>${remoteAllowed ? "" : '<p class="terminal-warning">远程密码 SSH 仅在使用已配置的 HTTPS 面板地址时可用。当前可以使用本机 SSH。</p>'}<p class="terminal-note">原生 root 部署使用仅监听回环地址的独立 SSH 服务自动连接；无需输入本机密码，也不修改系统 SSH 配置或 root 的 authorized_keys。退出此页面、退出登录或关闭浏览器时，SSH 会话将断开。</p></aside></div>`;
+  try {
+    terminalEmulator = new window.Terminal({ cursorBlink: true, scrollback: 5000, fontSize: 13, fontFamily: '"Cascadia Code",Consolas,monospace', theme: { background: "#14221f", foreground: "#dce9dc", cursor: "#c2df9d", selectionBackground: "#59826c88" } });
+    terminalFit = new window.FitAddon.FitAddon();
+    terminalEmulator.loadAddon(terminalFit);
+    terminalEmulator.open($("terminal-emulator"));
+    terminalFit.fit();
+    terminalEmulator.onData((data) => {
+      terminalInput(new TextEncoder().encode(data));
+    });
+    terminalEmulator.onBinary((data) => {
+      terminalInput(Uint8Array.from(data, (char) => char.charCodeAt(0) & 255));
+    });
+    terminalResizeObserver = new ResizeObserver(() => {
+      if (!terminalEmulator || !terminalFit) return;
+      terminalFit.fit();
+      const dimensions = terminalFit.proposeDimensions();
+      if (dimensions) terminalControl({ type: "resize", ...dimensions });
+    });
+    terminalResizeObserver.observe($("terminal-emulator"));
+    terminalStatus("正在连接本机 SSH…");
+    connectTerminal("local");
+  } catch (error) {
+    disposeTerminal();
+    terminalStatus(`终端初始化失败：${error.message}`, true);
   }
 }
 
-async function runCommand(command) {
-  if (!command || terminalBusy || !$("terminal-form")) return;
-  terminalBusy = true;
+const themeNames = { botanical: "苔影花园", topography: "等高线", nocturne: "月下档案", terracotta: "陶土织纹" };
+const themeDescriptions = { botanical: "蕨叶轮廓与雾林绿 · 平静、清透", topography: "地图等高线与矿物青 · 灵动、层叠", nocturne: "星图轨迹与靛蓝纸 · 深邃、克制", terracotta: "陶土花窗与奶油砂岩 · 温润、沉静" };
+
+function renderAppearance() {
+  const imageUrl = state.appearance.has_background ? `/api/appearance/background?v=${Date.now()}` : "";
+  $("view").innerHTML = `<section class="appearance-intro"><span class="appearance-orbit orbit-one"></span><span class="appearance-orbit orbit-two"></span><p class="eyebrow">A LITTLE MORE YOU</p><h2>让工作空间，也有自己的气息。</h2><p>每个主题都有独立的图案与色彩。上传图片仅保存于本机面板状态目录，不会传到外部服务。</p></section><div class="theme-grid">${Object.entries(themeNames).map(([id, name]) => `<button class="theme-card ${state.appearance.theme === id ? "is-selected" : ""}" data-theme-pick="${id}" data-preview-theme="${id}" aria-pressed="${state.appearance.theme === id}"><span class="theme-swatch"><i></i><i></i><i></i><i></i></span><span class="theme-card-copy"><strong>${name}</strong><small>${themeDescriptions[id]}</small></span><span class="theme-check">${state.appearance.theme === id ? "✓" : ""}</span></button>`).join("")}</div><section class="panel wallpaper-panel"><div class="wallpaper-preview ${imageUrl ? "has-wallpaper" : ""}" ${imageUrl ? `style="background-image:linear-gradient(120deg,#172d2999,#172d2966),url('${imageUrl}')"` : ""}><span class="wallpaper-preview-mark">${icon("sun")}</span><span>${imageUrl ? "当前自定义背景" : "背景预览"}</span></div><div class="wallpaper-controls"><div><h2>上传背景图片</h2><p>支持 PNG、JPEG、WebP，最大 1.5 MB（1,500,000 字节）、800 万像素；图片会在本机优化并移除元数据。</p><p class="muted">背景作为轻柔纹理呈现，不会干扰面板卡片内容。</p></div><div class="wallpaper-actions"><input id="background-upload" type="file" accept="image/png,image/jpeg,image/webp" hidden><button class="button primary" data-background-upload>${icon("upload")}选择图片</button>${imageUrl ? '<button class="button secondary" data-background-remove>移除背景</button>' : ""}</div></div></section>`;
+}
+
+async function uploadBackground(file) {
+  if (!file) return;
+  const allowed = ["image/png", "image/jpeg", "image/webp"];
+  if (!allowed.includes(file.type) || file.size > 1_500_000) { toast("请选择不超过 1.5 MB（1,500,000 字节） 的 PNG、JPEG 或 WebP 图片。", true); return; }
+  await changeAppearance(async () => {
   const session = state.session;
-  const generation = state.generation;
-  const form = $("terminal-form");
-  form.dataset.busy = "true";
-  form.querySelector("button").disabled = true;
-  state.commands.push(command);
-  state.historyIndex = state.commands.length;
-  state.terminal += `❯ ${command}\n`;
-  $("terminal-command").value = "";
-  const update = () => { const output = $("terminal-output"); if (output) { output.textContent = state.terminal; output.scrollTop = output.scrollHeight; } };
-  update();
+  const response = await fetch("/api/appearance/background", { method: "PUT", credentials: "same-origin", headers: { "X-CSRF-Token": state.csrf, "X-Image-Type": file.type }, body: file });
+  let result;
+  try { result = await response.json(); }
+  catch { throw new Error(`服务器返回了无效响应（HTTP ${response.status}）。`); }
+  if (session !== state.session) throw new Error("会话已更改，请重新操作。");
+  if (!response.ok) {
+    if (response.status === 401) showLogin();
+    throw new Error(result.error || `上传失败（HTTP ${response.status}）。`);
+  }
+  return result;
+  }, "背景图片已在本机安全保存。");
+}
+
+async function changeAppearance(operation, message) {
+  if (appearanceBusy) return;
+  appearanceBusy = true;
+  const session = state.session;
+  document.querySelectorAll("[data-theme-pick], [data-background-upload], [data-background-remove]").forEach((button) => { button.disabled = true; });
   try {
-    const result = await api("terminal", { method: "POST", body: { command } });
-    if (session === state.session && generation === state.generation) state.terminal += `${result.output}${result.exit_code && result.exit_code !== 0 ? `\n[退出码: ${result.exit_code}]` : ""}\n\n`;
-  } catch (error) { if (session === state.session && generation === state.generation) state.terminal += `Error: ${error.message}\n\n`; }
-  finally {
-    terminalBusy = false;
-    if (session === state.session && generation === state.generation) {
-      state.terminal = state.terminal.slice(-100000);
-      update();
-      const currentForm = $("terminal-form");
-      if (currentForm) { currentForm.dataset.busy = "false"; currentForm.querySelector("button").disabled = false; }
-      $("terminal-command")?.focus();
-    }
+    const appearance = await operation();
+    if (session !== state.session) return;
+    state.appearance = appearance;
+    applyAppearance();
+    toast(message);
+  } finally {
+    appearanceBusy = false;
+    if (session === state.session && state.view === "appearance") renderAppearance();
   }
 }
 
@@ -430,7 +574,7 @@ function renderProcesses(total) {
 }
 
 function auditName(action) {
-  const names = { login: "管理员登录", logout: "管理员退出", terminal: "执行诊断", "files.write": "保存文件", "files.mkdir": "创建文件夹", "containers.action": "容器管理" };
+  const names = { login: "管理员登录", logout: "管理员退出", terminal: "执行命令", "ssh.connect": "SSH 连接", "ssh.disconnect": "SSH 断开", "files.write": "保存文件", "files.mkdir": "创建文件夹", "containers.action": "容器管理", "appearance.background": "更换背景", appearance: "更换主题" };
   const base = action.replace(/\.requested$/, "");
   return `${names[base] || base}${action.endsWith(".requested") ? " · 请求" : ""}`;
 }
@@ -442,20 +586,16 @@ function renderAudit() {
 function renderInfo() {
   const m = state.metrics;
   const accessMode = state.session.full_host_root ? "全主机 root · 单管理员" : state.session.full_host ? "全主机 · 服务账户权限" : "受限文件目录 · 单管理员";
-  const terminalDescription = state.session.full_host_root
-    ? "原生 root Shell，可管理 VPS 文件、Docker 和系统命令。"
-    : state.session.full_host
-      ? "全主机路径访问与 Shell，权限受面板服务操作系统账户限制。"
-      : "预设只读诊断；没有通用 Shell 或宿主机 Docker socket。";
+  const terminalDescription = "交互式终端通过独立的本机 SSH 服务自动连接原生 root VPS；安装器会安装 OpenSSH，无需手动配置密钥。远程 root 密码 SSH 仅通过已配置 HTTPS 面板地址开放。";
   const proxyAdvice = state.session.public_http
     ? "公网 HTTP 未加密；限制来源 IP，或自行配置 Nginx 与 HTTPS。"
     : "需要域名访问时可自行配置 Nginx 与 HTTPS 反向代理。";
-  $("view").innerHTML = `<div class="info-grid"><section class="panel"><h2>当前主机</h2><dl class="host-details">${detail("主机名称", m.hostname, true)}${detail("系统", `${m.platform} ${m.release}`)}${detail("处理器", m.cpu_name)}${detail("架构 / 核心", `${m.architecture} / ${m.cpu_count}`)}${detail("物理内存", bytes(m.memory.total))}${detail("系统负载", m.load ? m.load.map((value) => value.toFixed(2)).join(" / ") : "此平台不提供 load average")}${detail("累计接收 / 发送", `${bytes(m.network.received_total)} / ${bytes(m.network.sent_total)}`)}</dl></section><section class="panel"><h2>工作台配置</h2><dl class="host-details">${detail("版本", `Harbor Panel ${state.session.version}`)}${detail("管理模式", accessMode)}${detail("文件根目录", state.session.file_root, true)}${detail("会话有效期", "8 小时，服务重启后失效")}${detail("监控采样", "2 秒 / 内存保留 90 个点")}${detail("文件编辑", "UTF-8 / 256 KiB / 版本检查")}${detail("会话与请求保护", "HttpOnly Cookie / SameSite / CSRF")}</dl></section><section class="panel info-wide"><h2>从这里继续扩展</h2><p>这是独立实现的核心运维版本，所有已显示指标来自当前运行主机。${terminalDescription}Docker CLI 与 daemon 需安装并运行；是否能管理容器取决于服务实际权限。${proxyAdvice}</p><ul><li>当前支持：监控、进程查看、目录浏览、UTF-8 文件创建/编辑/上传、文件下载、容器启停/重启/日志、终端与审计。</li><li>尚未实现：远程节点、网站与证书管理、应用市场、交互式 SSH / PTY、AI 助手和桌面窗口系统。</li><li>管理员账户每次安装仅注册一次；更新保留账户，卸载后旧凭证和账户失效。</li></ul><p>完整启动、测试与 Linux systemd 部署说明见项目目录中的 README.md。</p></section></div>`;
+  $("view").innerHTML = `<div class="info-grid"><section class="panel"><h2>当前主机</h2><dl class="host-details">${detail("主机名称", m.hostname, true)}${detail("系统", `${m.platform} ${m.release}`)}${detail("处理器", m.cpu_name)}${detail("架构 / 核心", `${m.architecture} / ${m.cpu_count}`)}${detail("物理内存", bytes(m.memory.total))}${detail("系统负载", m.load ? m.load.map((value) => value.toFixed(2)).join(" / ") : "此平台不提供 load average")}${detail("累计接收 / 发送", `${bytes(m.network.received_total)} / ${bytes(m.network.sent_total)}`)}</dl></section><section class="panel"><h2>工作台配置</h2><dl class="host-details">${detail("版本", `Harbor Panel ${state.session.version}`)}${detail("管理模式", accessMode)}${detail("文件根目录", state.session.file_root, true)}${detail("会话有效期", "8 小时，服务重启后失效")}${detail("监控采样", "2 秒 / 内存保留 90 个点")}${detail("文件编辑", "UTF-8 / 256 KiB / 版本检查")}${detail("会话与请求保护", "HttpOnly Cookie / SameSite / CSRF")}</dl></section><section class="panel info-wide"><h2>从这里继续扩展</h2><p>这是独立实现的核心运维版本，所有已显示指标来自当前运行主机。${terminalDescription}Docker CLI 与 daemon 需安装并运行；是否能管理容器取决于服务实际权限。${proxyAdvice}</p><ul><li>当前支持：监控、进程查看、目录浏览、UTF-8 文件创建/编辑/上传、文件下载、容器管理、SSH 终端、图案主题与本机背景图片、审计。</li><li>远程 SSH 会核对并记住首次接受的主机指纹；更换指纹时连接会被阻止。终端内容和密码不会写入审计记录。</li><li>管理员账户每次安装仅注册一次；更新保留账户，卸载后旧凭证和账户失效。</li></ul><p>完整启动、测试与 Linux systemd 部署说明见项目目录中的 README.md。</p></section></div>`;
 }
 
 function searchViews() {
   const query = $("search-input").value.trim().toLowerCase();
-  const aliases = { overview: "cpu memory dashboard 监控", files: "file upload 编辑 上传", containers: "docker logs 容器 日志", terminal: "shell command 诊断 命令", processes: "process pid 进程", audit: "audit log 审计 记录", info: "setting settings 配置 信息" };
+  const aliases = { overview: "cpu memory dashboard 监控", files: "file upload 编辑 上传", containers: "docker logs 容器 日志", terminal: "shell ssh pty 诊断 命令 远程服务器", processes: "process pid 进程", audit: "audit log 审计 记录", appearance: "theme background wallpaper 主题 外观 背景 图片", info: "setting settings 配置 信息" };
   const results = Object.entries(views).filter(([key, view]) => `${view.title} ${aliases[key]}`.toLowerCase().includes(query));
   $("search-results").innerHTML = results.map(([key, view]) => `<a class="search-result" href="#${key}" data-search-result>${icon(view.icon)}<div>${view.title}<small>${view.description}</small></div></a>`).join("") || empty("没有匹配的功能", "试试搜索「文件」「Docker」或「终端」。", "search");
 }
@@ -492,10 +632,11 @@ async function enterApp() {
   const session = await api("session");
   state.session = session;
   state.csrf = session.csrf;
+  const appearance = await api("appearance");
+  if (state.session !== session) return;
+  state.appearance = appearance;
+  applyAppearance();
   if (session.full_host) {
-    state.terminal = session.full_host_root
-      ? "Harbor root shell · 命令以 root 身份在 VPS 执行。每条命令最多 30 秒，输出上限 1 MiB。\n\n"
-      : "Harbor full-host shell · 命令以面板服务账户权限执行。每条命令最多 30 秒，输出上限 1 MiB。\n\n";
     let warning = $("security-warning");
     if (!warning) {
       warning = document.createElement("p");
@@ -544,8 +685,6 @@ $("logout").addEventListener("click", async () => {
     await api("logout", { method: "POST", body: {} });
     state.editor = null;
     state.metrics = null;
-    state.terminal = "Harbor diagnostics · 输入 help 查看可用命令。\n\n";
-    state.commands = [];
     showLogin();
   } catch (error) { toast(error.message, true); }
 });
@@ -603,34 +742,55 @@ document.addEventListener("click", async (event) => {
     if (target.hasAttribute("data-upload")) $("file-upload").click();
     if (target.hasAttribute("data-container") && target.dataset.action === "config") await openContainerConfig(Number(target.dataset.container));
     else if (target.hasAttribute("data-container")) await containerAction(Number(target.dataset.container), target.dataset.action, target);
-    if (target.hasAttribute("data-command")) await runCommand(target.dataset.command);
+    if (target.hasAttribute("data-terminal-action")) {
+      if (target.dataset.terminalAction === "local") connectTerminal("local");
+      else if (target.dataset.terminalAction === "disconnect") {
+        terminalConnectRequest = null;
+        if ($("remote-password")) $("remote-password").value = "";
+        terminalControl({ type: "disconnect" });
+        terminalStatus("SSH 已断开。");
+      }
+    }
+    if (target.hasAttribute("data-theme-pick")) {
+      await changeAppearance(() => api("appearance", { method: "POST", body: { theme: target.dataset.themePick } }), `已切换至「${themeNames[target.dataset.themePick]}」。`);
+    }
+    if (target.hasAttribute("data-background-upload")) $("background-upload").click();
+    if (target.hasAttribute("data-background-remove")) {
+      await changeAppearance(() => api("appearance/background/remove", { method: "POST", body: {} }), "已移除自定义背景。");
+    }
   } catch (error) { toast(error.message, true); }
 });
 
 document.addEventListener("change", (event) => {
   if (event.target.id === "file-upload") uploadFile(event.target.files[0]);
+  if (event.target.id === "background-upload") uploadBackground(event.target.files[0]).catch((error) => toast(error.message, true));
 });
 document.addEventListener("input", (event) => {
   if (event.target.id === "process-search") { state.filter = event.target.value; $("process-rows").innerHTML = processRows(); }
 });
 document.addEventListener("submit", (event) => {
-  if (event.target.id === "terminal-form") { event.preventDefault(); runCommand($("terminal-command").value.trim()); }
+  if (event.target.id === "remote-ssh-form") {
+    event.preventDefault();
+    if (!state.session?.https_remote_ssh) { toast("远程密码 SSH 仅在 HTTPS 面板地址下可用。", true); return; }
+    const password = $("remote-password").value;
+    if (!password) { toast("请输入远程 VPS 的 root 密码。", true); return; }
+    connectTerminal("remote", { host: $("remote-host").value.trim(), port: Number($("remote-port").value), username: "root", password });
+    $("remote-password").value = "";
+  }
 });
 document.addEventListener("keydown", (event) => {
+  if (event.target.closest?.(".xterm")) return;
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k" && state.session) {
     event.preventDefault();
     if (!document.querySelector("dialog[open]")) $("open-search").click();
   }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s" && $("editor-dialog").open) { event.preventDefault(); saveEditor(); }
-  if (event.target.id === "terminal-command" && ["ArrowUp", "ArrowDown"].includes(event.key)) {
-    event.preventDefault();
-    state.historyIndex = Math.max(0, Math.min(state.commands.length, state.historyIndex + (event.key === "ArrowUp" ? -1 : 1)));
-    event.target.value = state.commands[state.historyIndex] || "";
-  }
 });
 window.addEventListener("beforeunload", (event) => {
   if (state.editor && ($("editor-content").value !== state.editor.content || $("editor-name").value !== state.editor.path)) { event.preventDefault(); event.returnValue = ""; }
 });
+window.addEventListener("pagehide", disposeTerminal);
+window.addEventListener("pageshow", (event) => { if (event.persisted && state.view === "terminal" && state.session) navigate(); });
 window.addEventListener("hashchange", navigate);
 renderNav();
 enterApp().catch((error) => { showLogin(); if (!error.message.includes("sign in")) $("login-error").textContent = error.message; });

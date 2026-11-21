@@ -1,6 +1,6 @@
 # Harbor Panel
 
-从零编写的轻量单机运维面板。采用 **Python + 原生 JavaScript/CSS**，无需 Node 构建工具，只有一个 Python 依赖 `psutil`。可在 Windows 本地运行，也可原生部署在 Linux 上。
+从零编写的轻量单机运维面板。采用 **Python + 原生 JavaScript/CSS**，无需 Node 构建工具，Python 依赖为 `psutil`、`paramiko`、`wsproto` 和 `Pillow`。可在 Windows 本地运行，也可原生部署在 Linux 上。
 
 本项目使用原创代码、界面与品牌，提供轻量的单机运维管理功能。
 
@@ -15,9 +15,10 @@
 | 主机概览 | 真实 CPU、物理内存、文件根目录所在卷磁盘、全网卡吞吐、开机时间；2 秒采样，最多保留最近 90 点 |
 | 文件管理 | 浏览目录、新建目录、新建/编辑/上传 UTF-8 文本、下载文件；哈希版本冲突检查、编辑时原子替换 |
 | Docker | 读取当前 Docker context 的容器列表，启动/停止/重启、读取日志并编辑配置；重建失败时自动尝试恢复旧容器 |
-| 诊断终端 | 原生 VPS 部署提供带超时与输出上限的 root Shell；其他部署只提供预设只读诊断 |
+| 终端 | 浏览器内真实交互式 SSH，原生 root VPS 自动连接本机；HTTPS 下支持远程 root 密码连接、指纹确认、窗口缩放及持续输出 |
+| 外观主题 | 苔影花园、等高线、月下档案、陶土织纹四套图案主题；支持本机上传背景、切换和移除，重启后保留 |
 | 进程监控 | 真实 PID、进程名称、所属用户、状态、RSS；按内存降序显示前 150 个可访问进程 |
-| 操作审计 | 登录、退出、文件变更、诊断和容器操作的请求及结果；SQLite 保留最近 10,000 条 |
+| 操作审计 | 登录、退出、文件变更、SSH 连接/断开、外观及容器操作；不记录 SSH 密码与终端内容，SQLite 保留最近 10,000 条 |
 | 入口保护 | 密码散列验证、登录限速、服务端会话、HttpOnly/SameSite Cookie、Origin/Host 校验、CSRF、CSP |
 
 界面支持中文、窄屏导航、功能搜索（Ctrl/Cmd K）、编辑器保存快捷键（Ctrl/Cmd S）。所有图表来自实际采样；Docker 不可用时明确显示错误，不填充演示数据。
@@ -114,7 +115,7 @@ docker compose down
 
 ## Linux 部署
 
-需要直接监控和管理宿主机时，推荐使用原生部署方式。应用只依赖 Python 3.10+ 和 `psutil`，不绑定 Debian、Ubuntu、Alpine 或 CentOS 的专用系统 API。
+需要直接监控和管理宿主机时，推荐使用原生部署方式。应用要求 Python 3.10+，依赖见 `requirements.txt`；自动本机 SSH 还需要 OpenSSH server，由原生安装器安装。
 
 ### 发行版安装
 
@@ -147,9 +148,9 @@ sudo sh deploy/install.sh
 sudo HARBOR_PANEL_DIR=/srv/harbor-panel sh deploy/install.sh
 ```
 
-脚本会安装 Python、pip、虚拟环境组件和 `psutil` 所需的构建依赖。原生服务以 `root` 运行，使管理员能够管理宿主机文件、Docker 和系统命令。为避免 root 执行普通用户可修改的程序代码，安装器会将专用程序目录内的常规文件和目录归属迁移到 root，并移除组/其他用户的写权限；专用状态目录设为 root 独占，并将已知认证、审计和凭证文件设为 root 可读写。它不会修改 `/` 或独立工作区的所有权。请勿将用户数据或共享工作区放进程序目录。交互式管理菜单会生成权限为 `0600` 的一次性注册凭证文件，并在安装完成后只输出一次；请立即安全保存。更新保留管理员账户，完成注册后不能再次注册；卸载会使旧凭证和管理员账户失效，重新安装时生成新凭证。安装器会拒绝把程序或状态目录设为 `/`、系统关键目录或共享数据目录。
+原生服务以 `root` 运行，使管理员能够管理宿主机文件、Docker 和系统命令。为避免 root 执行普通用户可修改的程序代码，安装器会将专用程序目录内的常规文件和目录归属迁移到 root，并移除组/其他用户的写权限；专用状态目录设为 root 独占，并将已知认证、审计和凭证文件设为 root 可读写。它不会修改 `/` 或独立工作区的所有权。请勿将用户数据或共享工作区放进程序目录。交互式管理菜单会生成权限为 `0600` 的一次性注册凭证文件，并在安装完成后只输出一次；请立即安全保存。更新保留管理员账户，完成注册后不能再次注册；卸载会使旧凭证和管理员账户失效，重新安装时生成新凭证。安装器会拒绝把程序或状态目录设为 `/`、系统关键目录或共享数据目录。
 
-Debian/Ubuntu、CentOS/RHEL/Fedora 使用 `deploy/harbor-panel.service`；Alpine 使用 `deploy/harbor-panel.openrc`。管理菜单和安装器都会把最终路径写入 `/etc/harbor-panel.paths`，systemd/OpenRC 服务会自动读取；手动部署时复制对应服务模板并启用即可。程序目录中的虚拟环境需位于 `.venv`。
+安装器会安装 Python、pip、虚拟环境支持和 OpenSSH server，并在 `.venv` 中安装 `requirements.txt`。Debian/Ubuntu、CentOS/RHEL/Fedora 使用 `deploy/harbor-panel.service`；Alpine 使用 `deploy/harbor-panel.openrc`。管理菜单和安装器都会把最终路径写入 `/etc/harbor-panel.paths`，systemd/OpenRC 服务会自动读取；手动部署时复制对应服务模板并启用即可。程序目录中的虚拟环境需位于 `.venv`。
 
 1. 将此目录放到 `/opt/harbor-panel` 并安装虚拟环境依赖。
 2. 准备程序目录 `/opt/harbor-panel` 和专用状态目录 `/var/lib/harbor-panel`；原生服务以 root 运行，VPS 其余文件可通过面板管理。安装器会将专用程序目录中的常规文件/目录迁移为 root 所有，旧版独立工作区 `/srv/harbor-workspace` 不会被更新或卸载删除。
@@ -163,7 +164,11 @@ Debian/Ubuntu、CentOS/RHEL/Fedora 使用 `deploy/harbor-panel.service`；Alpine
 location / {
     proxy_pass http://127.0.0.1:8088;
     proxy_set_header Host $http_host;
-    proxy_read_timeout 60s;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 180s;
+    proxy_buffering off;
     client_max_body_size 2m;
 }
 ```
@@ -174,13 +179,21 @@ location / {
 
 原生 Linux systemd/OpenRC 服务以 root 运行，可访问标准 Docker socket；Docker CLI 和 daemon 仍需由用户在 VPS 上安装并启动。若容器页仍报权限错误，先确认 Docker daemon 和 CLI 可用，再检查 systemd 是否有覆盖服务用户/文件系统权限的 drop-in：`systemctl cat harbor-panel` 和 `systemctl show -p User -p DynamicUser -p ProtectSystem harbor-panel`。**不要盲目删除现有 drop-in**；只调整你确认属于 Harbor Panel、且确实限制权限的设置。若面板信息页未显示“全主机 root”，说明当前进程没有实际以 root 运行。Compose 容器模式不挂载宿主机 Docker socket，仍无法管理宿主机 Docker。
 
-### 权限与边界
+### SSH 终端与外观
+
+点击「终端」会自动连接原生 root VPS。本机使用面板单独启动的 OpenSSH 实例，仅监听 `127.0.0.1` 随机端口，使用每次进程启动生成的密钥；配置和密钥放在私有状态目录 `local-ssh/`，不修改系统 sshd 配置、SSH 端口或 root 的 `authorized_keys`。本机需允许 root 公钥登录及正常账户访问；账户被禁用或 PAM 拒绝时，面板会明确报错，不会解锁账户。排查启动错误请查看状态目录的 `local-ssh/sshd.log`。手动 Windows、非 root 或默认 Compose 部署不提供自动本机 SSH。
+
+远程连接输入主机、SSH 端口、root 用户和密码。此功能只在配置 `--public-origin https://...` 并通过对应 HTTPS 地址访问时开放。首次连接需核对并接受 SHA256 指纹；指纹保存在私有 `ssh_known_hosts`，变化时拒绝连接。密码不落盘。终端支持持续运行命令、交互程序、粘贴及窗口缩放；切换页面、退出登录、会话到期或关闭面板时断开 SSH，远端任务是否退出取决于远端 Shell/程序。每个登录会话最多三个终端，全局最多八个。
+
+「外观主题」提供四套带独立图案的主题，也可上传 PNG、JPEG 或 WebP 背景（最多 1,500,000 字节、800 万像素）。图片在本机解码、缩放至 2560×1600 范围并重新编码去除元数据；主题和背景保存在状态目录，不发送外部服务。脚本、字体和终端资源均从本机加载。终端使用 xterm.js 5.5.0 与 fit addon 0.10.0，其 MIT 许可证位于 `web/vendor/`；CSP 允许终端生成的内联样式，脚本仍仅允许同源。
+
+### 主机权限
 
 - 原生 Linux 部署的文件 API 可浏览宿主机 `/`，但隐藏并拒绝访问面板认证、凭证和审计状态目录；不支持设备名、NTFS 数据流及非便携文件名。符号链接只在原生全主机模式下跟随，目标仍须位于根目录内。
 - 文件编辑/上传限 256 KiB 且仅支持 UTF-8，下载限 8 MiB；文件 API 不提供删除/重命名。原生 root Shell 可执行系统管理命令，受信任管理员能通过 Shell 完整管理文件、服务、进程及 Docker。
-- 原生 root Shell 每条命令最多运行 30 秒，输出上限 1 MiB；命令在服务进程的当前工作目录执行（原生 systemd/OpenRC 模板设为 `/`）。命令仍以登录会话、Origin、CSRF 和审计保护。**Root Shell 可修改或删除系统文件、破坏系统或数据，公网 HTTP 还会暴露口令和会话。**只能授予可信管理员，并通过防火墙限流或配置 HTTPS 反向代理。面板不是多租户安全边界。
+- SSH 终端以登录会话、Origin、CSRF 和主机指纹验证保护。**Root Shell 可修改或删除系统文件、破坏系统或数据，公网 HTTP 还会暴露口令和会话。**只能授予可信管理员，并通过防火墙限流或配置 HTTPS 反向代理。面板不是多租户安全边界。
 - 除原生 Linux 全主机部署外，手动启动仍按当前操作系统账户与指定文件根目录运行；Docker 需要可用的 CLI 与 daemon。
-- 手动/Compose 模式的 `help`、`hostname`、`whoami`、`uptime`、`df -h`、`free -h`、`ps`、`docker ps` 是预设诊断，不提供 Shell；原生全主机模式开放 root Shell。
+- 旧版 `/api/terminal` 诊断接口保持兼容，其命令仍受 30 秒与 1 MiB 限制；新的交互式 SSH 终端不使用该接口。
 - 主机历史暂存在内存，服务重启后清空。审计保存在本地 SQLite，既不是防篡改存储，也不是集中日志系统。
 - 尚未实现远程节点、网站/证书、服务配置、应用市场、备份调度、AI 助手与桌面窗口系统。
 
@@ -193,13 +206,16 @@ python -m unittest discover -s tests -v
 node --check web/app.js
 ```
 
-测试使用临时目录和真实 HTTP 服务，覆盖登录/会话/CSRF、目录越界、文件冲突、真实监控与诊断、审计、Docker 参数验证与输出限制。Docker 生命周期测试使用 mock，不启停本机真实容器。Node 仅用于可选的前端语法检查，正常运行不需要安装。
+测试使用临时目录和真实 HTTP 服务，覆盖登录/会话/CSRF、目录越界、文件冲突、真实监控与诊断、审计、Docker 参数验证与输出限制，以及 WebSocket 握手/分片/注销、SSH 指纹确认与交互、主题持久化、图片校验和写入失败回滚。SSH 交互测试使用本机临时 Paramiko 服务；原生 OpenSSH 仍需在 Linux VPS 上验证。Docker 生命周期测试使用 mock，不启停本机真实容器。Node 仅用于可选的前端语法检查，正常运行不需要安装。
 
 ```text
 harbor-panel/
   server.py       HTTP、认证、路由、审计、启动入口
   host.py         主机采样、进程、Docker、诊断
   files.py        目录约束与文件读写
+  terminal.py     已认证 WebSocket 与 SSH 会话
+  local_ssh.py    原生 root 模式的独立回环 SSH 服务
+  appearance.py   本机主题与背景图片存储
   web/            原创中文管理界面，无构建步骤
   tests/          标准库 unittest 测试
   deploy/         Linux systemd 示例
