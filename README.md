@@ -15,7 +15,7 @@
 | 主机概览 | 真实 CPU、物理内存、文件根目录所在卷磁盘、全网卡吞吐、开机时间；2 秒采样，最多保留最近 90 点 |
 | 文件管理 | 浏览目录、新建目录、新建/编辑/上传 UTF-8 文本、下载文件；哈希版本冲突检查、编辑时原子替换 |
 | Docker | 读取当前 Docker context 的容器列表，启动/停止/重启、读取日志并编辑配置；重建失败时自动尝试恢复旧容器 |
-| 诊断终端 | 预设只读命令、历史记录、结构化执行；不调用任意 Shell |
+| 诊断终端 | 原生 VPS 部署提供带超时与输出上限的 root Shell；其他部署只提供预设只读诊断 |
 | 进程监控 | 真实 PID、进程名称、所属用户、状态、RSS；按内存降序显示前 150 个可访问进程 |
 | 操作审计 | 登录、退出、文件变更、诊断和容器操作的请求及结果；SQLite 保留最近 10,000 条 |
 | 入口保护 | 密码散列验证、登录限速、服务端会话、HttpOnly/SameSite Cookie、Origin/Host 校验、CSRF、CSP |
@@ -44,7 +44,7 @@ python3 -m venv .venv
 
 首次启动需要使用一次性 Base64 凭证注册管理员用户名和密码，并再次输入密码确认。注册后凭证立即失效，账户保存在状态目录中，服务重启后仍可使用；浏览器会话在服务重启时失效。
 
-默认只监听回环地址。默认文件管理目录为项目下的 `workspace/`，审计数据库位于 `.state/`；二者均已忽略，不会作为项目源码提交。可以直接将整个 `harbor-panel` 目录复制到其他位置独立运行。VPS 远程访问请显式设置 `--host 0.0.0.0`，并在云安全组和系统防火墙放行服务端口；公网直连使用 `http://<VPS公网IP>:<端口>`，正式环境建议配置 HTTPS 反向代理。
+默认只监听回环地址。默认文件管理目录为项目下的 `workspace/`，审计数据库位于 `.state/`；二者均已忽略，不会作为项目源码提交。可以直接将整个 `harbor-panel` 目录复制到其他位置独立运行。VPS 远程访问请显式设置 `--host 0.0.0.0`，并在云安全组和系统防火墙放行服务端口；公网直连使用 `http://<VPS公网IP>:<端口>`。**原生 Linux 服务模板以 root 运行，可完全管理 VPS；公网 HTTP 不加密，密码和登录会话可能被窃听。请限制端口来源，或自行配置 Nginx 与 HTTPS。**
 
 ### 自定义目录
 
@@ -133,7 +133,7 @@ curl -fsSL https://raw.githubusercontent.com/Jeromeliaya/harbor-panel/main/deplo
 sudo sh /tmp/harbor-panel-menu.sh
 ```
 
-菜单选项：`1` 安装、`2` 更新、`3` 卸载、`0` 退出。选择安装时会提示输入服务端口，允许 `0-65535`，直接回车使用默认端口 `8088`；端口配置保存于 `/etc/harbor-panel.port`，后续更新会自动沿用。端口 `0` 由操作系统临时分配，适合测试，不适合作为固定访问地址。卸载需要输入 `UNINSTALL` 确认，清除管理员账户和注册凭证以使其失效，保留 `/srv/harbor-workspace`、审计数据及 `/etc/harbor-panel.env`；重新安装会生成新的注册凭证。更新不会重置账户或凭证。如服务器没有 `curl`，可使用 `wget` 替代下载菜单脚本。
+菜单选项：`1` 安装、`2` 更新、`3` 卸载、`0` 退出。选择安装时会提示输入服务端口，允许 `0-65535`，直接回车使用默认端口 `8088`；端口配置保存于 `/etc/harbor-panel.port`，后续更新会自动沿用。自定义程序和状态目录保存于 `/etc/harbor-panel.paths`，后续菜单操作会继续使用。端口 `0` 由操作系统临时分配，适合测试，不适合作为固定访问地址。卸载需要输入 `UNINSTALL` 确认，清除管理员账户和注册凭证以使其失效，保留 `/srv/harbor-workspace`、审计数据及 `/etc/harbor-panel.env`；重新安装会生成新的注册凭证。更新不会重置账户或凭证。如服务器没有 `curl`，可使用 `wget` 替代下载菜单脚本。
 
 源码默认放在 `/opt/harbor-panel` 时，在项目目录执行：
 
@@ -141,60 +141,46 @@ sudo sh /tmp/harbor-panel-menu.sh
 sudo sh deploy/install.sh
 ```
 
-如果源码位于其他目录，设置 `HARBOR_PANEL_DIR`；也可以用环境变量调整面板用户和数据目录。脚本不会覆盖已有的 `/etc/harbor-panel.env`、工作区或审计数据库：
+如果源码位于其他目录，设置 `HARBOR_PANEL_DIR`；需要自定义状态目录时可设置 `HARBOR_PANEL_STATE`。安装器会将实际路径保存到 `/etc/harbor-panel.paths`，systemd/OpenRC 服务会自动读取。原生服务始终以 root 运行，不支持切换为受限服务用户。脚本不会覆盖已有的 `/etc/harbor-panel.env`、工作区或审计数据库：
 
 ```sh
 sudo HARBOR_PANEL_DIR=/srv/harbor-panel sh deploy/install.sh
 ```
 
-脚本会安装 Python、pip、虚拟环境组件和 `psutil` 所需的构建依赖，创建普通用户 `harbor`。交互式管理菜单会生成权限为 `0600` 的一次性注册凭证文件，并在安装完成后只输出一次；请立即安全保存。
+脚本会安装 Python、pip、虚拟环境组件和 `psutil` 所需的构建依赖。原生服务以 `root` 运行，使管理员能够管理宿主机文件、Docker 和系统命令。为避免 root 执行普通用户可修改的程序代码，安装器会将专用程序目录内的常规文件和目录归属迁移到 root，并移除组/其他用户的写权限；专用状态目录设为 root 独占，并将已知认证、审计和凭证文件设为 root 可读写。它不会修改 `/` 或独立工作区的所有权。请勿将用户数据或共享工作区放进程序目录。交互式管理菜单会生成权限为 `0600` 的一次性注册凭证文件，并在安装完成后只输出一次；请立即安全保存。更新保留管理员账户，完成注册后不能再次注册；卸载会使旧凭证和管理员账户失效，重新安装时生成新凭证。安装器会拒绝把程序或状态目录设为 `/`、系统关键目录或共享数据目录。
 
-Debian/Ubuntu、CentOS/RHEL/Fedora 使用 `deploy/harbor-panel.service`；Alpine 使用 `deploy/harbor-panel.openrc`。脚本最后会打印当前系统对应的启用命令。若自定义了 `HARBOR_PANEL_DIR`、`HARBOR_PANEL_WORKSPACE` 或 `HARBOR_PANEL_STATE`，请同步修改服务模板中的路径。
+Debian/Ubuntu、CentOS/RHEL/Fedora 使用 `deploy/harbor-panel.service`；Alpine 使用 `deploy/harbor-panel.openrc`。管理菜单和安装器都会把最终路径写入 `/etc/harbor-panel.paths`，systemd/OpenRC 服务会自动读取；手动部署时复制对应服务模板并启用即可。程序目录中的虚拟环境需位于 `.venv`。
 
 1. 将此目录放到 `/opt/harbor-panel` 并安装虚拟环境依赖。
-2. 创建专用普通用户 `harbor`、其可读写的 `/srv/harbor-workspace` 与 `/var/lib/harbor-panel`。
+2. 准备程序目录 `/opt/harbor-panel` 和专用状态目录 `/var/lib/harbor-panel`；原生服务以 root 运行，VPS 其余文件可通过面板管理。安装器会将专用程序目录中的常规文件/目录迁移为 root 所有，旧版独立工作区 `/srv/harbor-workspace` 不会被更新或卸载删除。
 3. 使用菜单安装以生成并展示一次性 Base64 凭证；手动部署请将随机凭证保存在状态目录中的 `bootstrap.token`（权限 `0600`），并在启动命令加入 `--bootstrap-token-file /var/lib/harbor-panel/bootstrap.token`。
 4. 将对应的 systemd 或 OpenRC 服务模板复制到系统服务目录，确认文件路径和账户正确，再启用服务。
 5. 菜单安装会自动尝试显示 VPS 公网 IP，访问 `http://<VPS公网IP>:<所选端口>` 并完成首次注册；若 IP 无法自动探测，请从 VPS 服务商控制台获取。确认云安全组及系统防火墙允许该 TCP 端口入站。手动部署使用公网访问时，在启动命令加入 `--host 0.0.0.0`；若只希望通过 SSH 隧道访问，则继续使用 `ssh -L 8088:127.0.0.1:8088 user@your-server`，然后访问本机 `http://127.0.0.1:8088`。
 
-如需使用域名，在 HTTPS 反向代理后运行，并在 service 的 `ExecStart` 末尾添加 `--public-origin https://panel.example.com`。外部 Origin 必须精确匹配协议、主机及非默认端口；该模式设置 Secure Cookie，必须使用 HTTPS 浏览器入口。反向代理要保留 Host，例如已有 TLS Nginx server 内配置：
+如需使用域名，可选配置 Nginx 与 HTTPS，并在 service 的 `ExecStart` 末尾添加 `--public-origin https://panel.example.com`。外部 Origin 必须精确匹配 HTTPS 协议、主机及非默认端口；该模式设置 Secure Cookie，浏览器登录必须通过指定 HTTPS 域名。配置该模式后，原有公网 IP:端口 HTTP 登录会被拒绝；不配置 `--public-origin` 时则可继续通过公网 IP 和端口访问，但必须接受未加密 HTTP 风险。反向代理要保留 Host，例如 TLS Nginx server 内配置：
 
 ```nginx
 location / {
     proxy_pass http://127.0.0.1:8088;
     proxy_set_header Host $http_host;
-    proxy_read_timeout 25s;
+    proxy_read_timeout 60s;
     client_max_body_size 2m;
 }
 ```
 
-保持后端回环监听；通过防火墙限制管理入口。后端不信任 `X-Forwarded-For`，代理部署下审计来源及登录限速按代理地址统计。这里使用 Python 标准库 HTTP 服务，面向单管理员低并发场景，不建议作为直接暴露公网的大规模控制面。
+示例后端端口为 `8088`。建议同时用 VPS 防火墙限制该端口，只允许可信来源或本机代理。后端不信任 `X-Forwarded-For`，代理部署下审计来源及登录限速按代理地址统计。这里使用 Python 标准库 HTTP 服务，面向单管理员低并发场景，不建议作为直接暴露公网的大规模控制面。
 
-### Docker 权限（原生部署，可选）
+### Docker 管理
 
-如果容器页提示「Docker 权限不足」，先确认宿主机已安装 Docker，且 `sudo docker info` 能成功连接。以下步骤仅适用于普通 Linux Docker 服务、且 socket 所属组为 `docker` 的情况，可用 `ls -l /var/run/docker.sock` 核实。
-
-**Docker socket 访问权限接近主机 root 权限。** 只在信任面板和管理员、且管理入口受防火墙或私有网络限制时授予。不要把 socket 改成全员可读写，也不要以 root 运行面板。
-
-- **systemd**：运行 `sudo systemctl edit harbor-panel`，填入下方配置，然后执行 `sudo systemctl restart harbor-panel`。独立的覆盖配置不会被菜单更新覆盖。
-- **Alpine / OpenRC**：执行 `sudo addgroup harbor docker`，再执行 `sudo rc-service harbor-panel restart`。若已是组成员，只需重启。
-
-```ini
-[Service]
-SupplementaryGroups=docker
-```
-
-完成后刷新容器页。要撤销授权，systemd 用 `sudo systemctl edit harbor-panel` 删除添加的 `SupplementaryGroups=docker` 配置（若覆盖文件只有这段配置，删除该覆盖文件后执行 `sudo systemctl daemon-reload`）；OpenRC 执行 `sudo delgroup harbor docker`。撤销后重启面板。若页面显示「无法连接 Docker 服务」，请先检查 Docker daemon 与面板使用的 Docker context，而不是扩大权限。
+原生 Linux systemd/OpenRC 服务以 root 运行，可访问标准 Docker socket；Docker CLI 和 daemon 仍需由用户在 VPS 上安装并启动。若容器页仍报权限错误，先确认 Docker daemon 和 CLI 可用，再检查 systemd 是否有覆盖服务用户/文件系统权限的 drop-in：`systemctl cat harbor-panel` 和 `systemctl show -p User -p DynamicUser -p ProtectSystem harbor-panel`。**不要盲目删除现有 drop-in**；只调整你确认属于 Harbor Panel、且确实限制权限的设置。若面板信息页未显示“全主机 root”，说明当前进程没有实际以 root 运行。Compose 容器模式不挂载宿主机 Docker socket，仍无法管理宿主机 Docker。
 
 ### 权限与边界
 
-- 文件根目录之外不可通过文件 API 访问；不跟随符号链接或 Windows junction，不支持保留设备名、NTFS 数据流及非便携文件名。
-- 文件编辑/上传限 256 KiB，必须是有效 UTF-8；下载限 8 MiB。不提供删除文件或结束进程操作。
-- 管理目录应由面板账户控制，**不要允许不可信本地账户并发改动目录结构**。路径检查不能替代操作系统隔离；这个目录限制不是抵御恶意本地进程的安全沙箱。
-- 文件保存使用内容哈希检查外部变更；检查与替换之间仍不构成跨进程文件锁，不适合多个不受控写入者同时改同一配置。
-- 面板按当前操作系统账户权限运行，不自动提权。不要为了方便给它 root 权限。
-- Docker 需要可用的 CLI 与 daemon。Docker socket 权限接近主机管理员权限，应仅在信任的管理员环境授予；systemd 示例默认不添加 docker 组。
-- `help`、`hostname`、`whoami`、`uptime`、`df -h`、`free -h`、`ps`、`docker ps` 是可用诊断。它们是跨平台结构化诊断，并不提供 SSH / PTY / Shell 兼容性。
+- 原生 Linux 部署的文件 API 可浏览宿主机 `/`，但隐藏并拒绝访问面板认证、凭证和审计状态目录；不支持设备名、NTFS 数据流及非便携文件名。符号链接只在原生全主机模式下跟随，目标仍须位于根目录内。
+- 文件编辑/上传限 256 KiB 且仅支持 UTF-8，下载限 8 MiB；文件 API 不提供删除/重命名。原生 root Shell 可执行系统管理命令，受信任管理员能通过 Shell 完整管理文件、服务、进程及 Docker。
+- 原生 root Shell 每条命令最多运行 30 秒，输出上限 1 MiB；命令在服务进程的当前工作目录执行（原生 systemd/OpenRC 模板设为 `/`）。命令仍以登录会话、Origin、CSRF 和审计保护。**Root Shell 可修改或删除系统文件、破坏系统或数据，公网 HTTP 还会暴露口令和会话。**只能授予可信管理员，并通过防火墙限流或配置 HTTPS 反向代理。面板不是多租户安全边界。
+- 除原生 Linux 全主机部署外，手动启动仍按当前操作系统账户与指定文件根目录运行；Docker 需要可用的 CLI 与 daemon。
+- 手动/Compose 模式的 `help`、`hostname`、`whoami`、`uptime`、`df -h`、`free -h`、`ps`、`docker ps` 是预设诊断，不提供 Shell；原生全主机模式开放 root Shell。
 - 主机历史暂存在内存，服务重启后清空。审计保存在本地 SQLite，既不是防篡改存储，也不是集中日志系统。
 - 尚未实现远程节点、网站/证书、服务配置、应用市场、备份调度、AI 助手与桌面窗口系统。
 

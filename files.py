@@ -1,4 +1,4 @@
-"""Directory-scoped text file management with optimistic concurrency."""
+"""Scoped text file management with optimistic concurrency."""
 
 import hashlib
 import os
@@ -19,10 +19,16 @@ class FileStore:
     MAX_TEXT = 256 * 1024
     MAX_DOWNLOAD = 8 * 1024 * 1024
 
-    def __init__(self, root):
+    def __init__(self, root, protected_paths=(), allow_symlinks=False):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.protected_paths = tuple(Path(path).resolve() for path in protected_paths)
+        self.allow_symlinks = allow_symlinks
         self.lock = threading.RLock()
+
+    def _protected(self, target):
+        resolved = Path(target).resolve()
+        return any(resolved == path or resolved.is_relative_to(path) for path in self.protected_paths)
 
     def resolve(self, relative=""):
         if not isinstance(relative, str) or any(c in relative for c in ("\\", ":", "\x00")):
@@ -35,10 +41,16 @@ class FileStore:
             if PureWindowsPath(part).is_reserved() or part.endswith((" ", ".")) or any(ord(c) < 32 or c in '<>"|?*' for c in part):
                 raise PanelError("Use a portable file name without reserved characters.")
             target = target / part
-            if target.is_symlink() or (hasattr(target, "is_junction") and target.is_junction()):
+            if not self.allow_symlinks and (target.is_symlink() or (hasattr(target, "is_junction") and target.is_junction())):
                 raise PanelError("Symbolic links and junctions cannot be followed.", 403)
+            if self.allow_symlinks:
+                target = target.resolve()
+                if not target.is_relative_to(self.root):
+                    raise PanelError("Path is outside the configured file root.", 403)
         if not target.resolve().is_relative_to(self.root):
             raise PanelError("Path is outside the configured file root.", 403)
+        if self._protected(target):
+            raise PanelError("Panel authentication and state files are not accessible through file management.", 403)
         return target
 
     def listing(self, relative=""):
@@ -52,11 +64,16 @@ class FileStore:
                 if index >= 2000:
                     truncated = True
                     break
-                info = entry.stat(follow_symlinks=False)
+                if self._protected(entry.path):
+                    continue
                 linked = entry.is_symlink() or (hasattr(os.path, "isjunction") and os.path.isjunction(entry.path))
+                try:
+                    info = entry.stat(follow_symlinks=self.allow_symlinks)
+                except FileNotFoundError:
+                    info = entry.stat(follow_symlinks=False)
                 entries.append({
                     "name": entry.name,
-                    "directory": not linked and entry.is_dir(follow_symlinks=False),
+                    "directory": entry.is_dir(follow_symlinks=self.allow_symlinks),
                     "linked": linked,
                     "size": info.st_size,
                     "modified": info.st_mtime,
@@ -116,13 +133,16 @@ class FileStore:
                 current = self.read(relative)
                 if not isinstance(etag, str) or current["etag"] != etag:
                     raise PanelError("File changed on disk. Reload before saving.", 409)
-                mode = stat.S_IMODE(target.stat().st_mode)
+                original = target.stat()
+                mode = stat.S_IMODE(original.st_mode)
                 descriptor, temporary = tempfile.mkstemp(prefix=".harbor-", dir=target.parent)
                 try:
                     with os.fdopen(descriptor, "wb") as stream:
                         stream.write(data)
                         stream.flush()
                         os.fsync(stream.fileno())
+                        if hasattr(os, "fchown") and hasattr(os, "geteuid") and os.geteuid() == 0:
+                            os.fchown(stream.fileno(), original.st_uid, original.st_gid)
                     os.chmod(temporary, mode)
                     os.replace(temporary, target)
                 finally:

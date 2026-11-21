@@ -2,10 +2,13 @@
 
 from http.client import HTTPConnection
 import hashlib
+from io import BytesIO
 import json
+import os
 from pathlib import Path
 import socket
 import sys
+import subprocess
 import tempfile
 import threading
 import time
@@ -85,6 +88,45 @@ class FileStoreTests(unittest.TestCase):
         self.assertEqual([entry["name"] for entry in listing["entries"]], ["docs", "a.txt"])
         self.assertTrue(listing["entries"][0]["directory"])
         self.assertEqual(self.files.listing("docs")["entries"], [])
+
+    def test_protected_state_is_hidden_and_inaccessible(self):
+        state = self.root / "var" / "lib" / "harbor-panel"
+        state.mkdir(parents=True)
+        (state / "auth.sqlite3").write_text("private", encoding="utf-8")
+        files = FileStore(self.root, protected_paths=(state,))
+        self.assertEqual(files.listing("var/lib")["entries"], [])
+        with self.assertRaises(PanelError) as context:
+            files.read("var/lib/harbor-panel/auth.sqlite3")
+        self.assertEqual(context.exception.status, 403)
+
+    def test_full_host_links_stay_in_root_and_cannot_alias_protected_state(self):
+        target = self.root / "ordinary.txt"
+        target.write_text("visible", encoding="utf-8")
+        state = self.root / "state"
+        state.mkdir()
+        (state / "auth.sqlite3").write_text("private", encoding="utf-8")
+        try:
+            (self.root / "ordinary-link").symlink_to(target)
+            (self.root / "state-link").symlink_to(state, target_is_directory=True)
+        except OSError:
+            self.skipTest("Symbolic links are unavailable on this system.")
+
+        files = FileStore(self.root, protected_paths=(state,), allow_symlinks=True)
+        self.assertEqual(files.read("ordinary-link")["content"], "visible")
+        self.assertNotIn("state-link", [entry["name"] for entry in files.listing()["entries"]])
+        with self.assertRaises(PanelError) as context:
+            files.read("state-link/auth.sqlite3")
+        self.assertEqual(context.exception.status, 403)
+
+    def test_updating_file_preserves_mode(self):
+        if os.name == "nt":
+            self.skipTest("POSIX permission bits are not reliable on Windows.")
+        target = self.root / "config.txt"
+        target.write_text("old", encoding="utf-8")
+        target.chmod(0o640)
+        current = self.files.read("config.txt")
+        self.files.write("config.txt", "new", current["etag"])
+        self.assertEqual(target.stat().st_mode & 0o777, 0o640)
 
 
 class HTTPTests(unittest.TestCase):
@@ -207,6 +249,29 @@ class HTTPTests(unittest.TestCase):
                 thread.join(timeout=2)
                 server.host.close()
 
+    def test_secure_public_origin_rejects_direct_http_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = PanelServer(("0.0.0.0", 0), "long-enough-password", root / "files", root / "state", "https://panel.example.com")
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = server.server_address[1]
+                connection = HTTPConnection("127.0.0.1", port, timeout=10)
+                connection.request(
+                    "POST",
+                    "/api/login",
+                    json.dumps({"username": "administrator", "password": "wrong"}),
+                    {"Content-Type": "application/json", "Host": f"198.51.100.10:{port}", "Origin": f"http://198.51.100.10:{port}"},
+                )
+                self.assertEqual(connection.getresponse().status, 403)
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                server.host.close()
+
     def test_malformed_and_oversized_requests(self):
         self.assertEqual(self.request("POST", "/api/login", raw=b"{", headers={"Content-Type": "application/json"})[0], 400)
         self.assertEqual(self.request("POST", "/api/login", raw=b"[]", headers={"Content-Type": "application/json"})[0], 400)
@@ -260,6 +325,28 @@ class HTTPTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.request("POST", "/api/terminal", {"command": command})[0], 400)
 
+    def test_full_host_shell_audit_redacts_commands_and_marks_nonzero_exit(self):
+        self.login()
+        original_full_host = self.server.full_host
+        original_host_full_host = self.server.host.full_host
+        self.server.full_host = True
+        self.server.host.full_host = True
+        command = "secret-command-argument"
+        try:
+            with mock.patch.object(self.server.host, "terminal", return_value={"command": command, "output": "failed", "exit_code": 7}):
+                status, result, _ = self.request("POST", "/api/terminal", {"command": command})
+            self.assertEqual(status, 200)
+            self.assertEqual(result["exit_code"], 7)
+            _, audit, _ = self.request("GET", "/api/audit")
+            shell_events = [event for event in audit["events"] if event["action"] == "terminal" and event["target"] == "host shell command"]
+            self.assertEqual(len(shell_events), 1)
+            self.assertFalse(shell_events[0]["success"])
+            self.assertEqual(shell_events[0]["target"], "host shell command")
+            self.assertNotIn(command, json.dumps(audit))
+        finally:
+            self.server.full_host = original_full_host
+            self.server.host.full_host = original_host_full_host
+
     def test_docker_parsing_actions_validation_and_service_error(self):
         self.login()
         item = {"ID": "a" * 64, "Names": "example", "Image": "example:latest", "State": "running", "Status": "Up"}
@@ -289,6 +376,21 @@ class HTTPTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_full_host_mode_allows_state_inside_root_but_hides_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "var" / "lib" / "harbor-panel"
+            state.mkdir(parents=True)
+            server = PanelServer(("127.0.0.1", 0), "long-enough-password", root, state, full_host=True)
+            try:
+                self.assertTrue(server.full_host)
+                self.assertEqual(server.files.listing("var/lib")["entries"], [])
+                with self.assertRaises(PanelError):
+                    server.files.listing("var/lib/harbor-panel")
+            finally:
+                server.host.close()
+                server.server_close()
+
     def test_registration_consumes_token_and_persists_account(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -309,9 +411,19 @@ class ConfigurationTests(unittest.TestCase):
                     auth.register("Zmlyc3QtdXNlLXRva2Vu", "admin", "long-enough-password", "long-enough-password", "127.0.0.1")
                 restarted = Auth(state_dir=root / "state")
                 self.assertEqual(restarted.username, "admin")
+                self.assertIsNone(PanelServer.prepare_bootstrap_token(root / "state"))
                 restarted.login("admin", "long-enough-password", "127.0.0.1")
                 with self.assertRaises(PanelError):
                     restarted.login("other", "long-enough-password", "127.0.0.1")
+                restarted_server = PanelServer(
+                    ("127.0.0.1", 0), None, root / "files", root / "state",
+                    bootstrap_token_file=token_file, full_host=True,
+                )
+                try:
+                    self.assertFalse(restarted_server.auth.setup_required())
+                finally:
+                    restarted_server.host.close()
+                    restarted_server.server_close()
             finally:
                 server.host.close()
                 server.server_close()
@@ -344,6 +456,92 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaises(PanelError) as context:
                 host.docker_command("-c", "import sys; sys.stdout.write('x' * (2 * 1024 * 1024))")
             self.assertEqual(context.exception.status, 413)
+
+    def test_full_host_terminal_runs_bounded_shell_command(self):
+        host = Host.__new__(Host)
+        host.full_host = True
+        process = mock.Mock()
+        process.stdout = BytesIO(b"root\n")
+        process.wait.return_value = 0
+        process.returncode = 0
+        with mock.patch("host.subprocess.Popen", return_value=process) as popen:
+            result = host.terminal("whoami")
+        self.assertEqual(result, {"command": "whoami", "output": "root\n", "exit_code": 0})
+        arguments = popen.call_args.args[0]
+        if sys.platform == "win32":
+            self.assertEqual(arguments[1:3], ["/d", "/s"])
+        else:
+            self.assertEqual(arguments[:2], ["/bin/sh", "-c"])
+        self.assertFalse(popen.call_args.kwargs["shell"])
+        self.assertEqual(popen.call_args.kwargs["stdout"], subprocess.PIPE)
+
+    def test_full_host_terminal_reports_nonzero_exit_code(self):
+        host = Host.__new__(Host)
+        host.full_host = True
+        process = mock.Mock()
+        process.pid = 123
+        process.stdout = BytesIO(b"failed\n")
+        process.wait.return_value = 0
+        process.returncode = 7
+        with mock.patch("host.subprocess.Popen", return_value=process):
+            result = host.terminal("false")
+        self.assertEqual(result["output"], "failed\n")
+        self.assertEqual(result["exit_code"], 7)
+
+    def test_full_host_terminal_enforces_output_limit(self):
+        host = Host.__new__(Host)
+        host.full_host = True
+        host.MAX_COMMAND_OUTPUT = 4
+        process = mock.Mock()
+        process.pid = 123
+        process.stdout = BytesIO(b"too much output")
+        process.wait.return_value = 0
+        process.returncode = 0
+        with mock.patch("host.subprocess.Popen", return_value=process), mock.patch("host.subprocess.run"), mock.patch("host.os.killpg", create=True):
+            with self.assertRaises(PanelError) as context:
+                host.terminal("generate output")
+        self.assertEqual(context.exception.status, 413)
+
+    def test_full_host_terminal_reports_output_reader_errors(self):
+        host = Host.__new__(Host)
+        host.full_host = True
+        stream = mock.Mock()
+        stream.__enter__ = mock.Mock(return_value=stream)
+        stream.__exit__ = mock.Mock(return_value=False)
+        stream.read.side_effect = OSError("stream failed")
+        process = mock.Mock()
+        process.pid = 123
+        process.stdout = stream
+        process.wait.return_value = 0
+        process.returncode = 0
+        with mock.patch("host.subprocess.Popen", return_value=process):
+            with self.assertRaises(PanelError) as context:
+                host.terminal("whoami")
+        self.assertEqual(context.exception.status, 502)
+        self.assertIn("stream failed", str(context.exception))
+
+    def test_full_host_terminal_rejects_empty_command(self):
+        host = Host.__new__(Host)
+        host.full_host = True
+        with self.assertRaises(PanelError):
+            host.terminal("  ")
+
+    @unittest.skipIf(os.name == "nt", "The native VPS service uses POSIX shell process groups.")
+    def test_full_host_shell_executes_commands_and_enforces_limits(self):
+        host = Host.__new__(Host)
+        host.MAX_COMMAND_OUTPUT = 1024
+        host.COMMAND_TIMEOUT = 0.1
+        success = host.run_command("printf 'hello'")
+        self.assertEqual((success["output"], success["exit_code"]), ("hello", 0))
+        failure = host.run_command("printf 'failed'; exit 7")
+        self.assertEqual((failure["output"], failure["exit_code"]), ("failed", 7))
+        host.MAX_COMMAND_OUTPUT = 4
+        with self.assertRaises(PanelError) as context:
+            host.run_command("printf 12345")
+        self.assertEqual(context.exception.status, 413)
+        with self.assertRaises(PanelError) as context:
+            host.run_command("sleep 2")
+        self.assertEqual(context.exception.status, 504)
 
     def test_docker_cli_failure_diagnostics(self):
         host = Host.__new__(Host)

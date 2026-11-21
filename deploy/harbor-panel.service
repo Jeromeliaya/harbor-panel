@@ -4,23 +4,21 @@ After=network.target
 
 [Service]
 Type=simple
-User=harbor
-Group=harbor
-WorkingDirectory=/opt/harbor-panel
-EnvironmentFile=-/etc/harbor-panel.env
+User=root
+Group=root
+Environment=HARBOR_PANEL_DIR=/opt/harbor-panel
+Environment=HARBOR_PANEL_STATE=/var/lib/harbor-panel
 Environment=HARBOR_PANEL_PORT=8088
+EnvironmentFile=-/etc/harbor-panel.env
+EnvironmentFile=-/etc/harbor-panel.paths
 EnvironmentFile=-/etc/harbor-panel.port
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/opt/harbor-panel/.venv/bin/python /opt/harbor-panel/server.py --host 0.0.0.0 --port ${HARBOR_PANEL_PORT} --root /srv/harbor-workspace --state-dir /var/lib/harbor-panel --bootstrap-token-file /var/lib/harbor-panel/bootstrap.token
+WorkingDirectory=/
+ExecStart=/bin/sh -c 'exec "$${HARBOR_PANEL_DIR}/.venv/bin/python" "$${HARBOR_PANEL_DIR}/server.py" --host 0.0.0.0 --port "$${HARBOR_PANEL_PORT}" --root / --state-dir "$${HARBOR_PANEL_STATE}" --bootstrap-token-file "$${HARBOR_PANEL_STATE}/bootstrap.token" --full-host'
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
 UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/srv/harbor-workspace /var/lib/harbor-panel
 
 [Install]
 WantedBy=multi-user.target

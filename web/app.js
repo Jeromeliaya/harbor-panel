@@ -62,6 +62,7 @@ function showLogin() {
   $("app").hidden = true;
   $("boot").hidden = true;
   $("login").hidden = false;
+  $("security-warning")?.remove();
   refreshAuthForm().catch((error) => { $("login-error").textContent = error.message; });
   document.querySelectorAll("dialog[open]").forEach((dialog) => dialog.close());
 }
@@ -73,7 +74,12 @@ async function refreshAuthForm() {
   $("auth-title").textContent = setup.required ? "创建管理员账户" : "登录你的工作台";
   $("auth-description").textContent = setup.required ? "使用安装时提供的一次性凭证完成首次注册。" : "使用管理员账户登录。";
   $("auth-submit").innerHTML = setup.required ? '创建账户 <span aria-hidden="true">↗</span>' : '进入工作台 <span aria-hidden="true">↗</span>';
-  $("login-hint").textContent = setup.required ? "凭证仅可使用一次，注册后立即失效。" : "首次运行请先完成管理员注册。";
+  const warnings = [];
+  if (setup.full_host_root) warnings.push("此原生服务以 root 运行，管理员可完全控制 VPS，包括系统文件、Docker 和命令执行。仅在信任的环境使用。");
+  if (setup.public_http) warnings.push("当前可通过公网 HTTP 访问：连接未加密，密码和登录会话可能被窃听。建议限制来源 IP，或配置 Nginx 与 HTTPS。");
+  const hint = setup.required ? "凭证仅可使用一次，注册后立即失效。" : "请使用已注册的管理员账户登录。";
+  $("login-hint").textContent = [...warnings, hint].join(" ");
+  $("login-hint").classList.toggle("is-warning", warnings.length > 0);
   $("password").required = !setup.required;
   $("username").required = !setup.required;
   $("credential").required = setup.required;
@@ -119,7 +125,7 @@ function empty(title, description, symbol = "folder") {
 function viewError(error) {
   if (state.view === "containers") {
     const dockerErrors = {
-      docker_socket_permission: ["Docker 权限不足", "面板服务无法访问 Docker socket。请由 VPS 管理员按 README 的 Docker 权限说明授权并重启面板。Docker 权限接近主机 root 权限。"],
+      docker_socket_permission: ["Docker 权限不足", "面板进程无法访问当前 Docker socket。原生 root 部署仍无法连接时，请检查 Docker daemon 是否运行、CLI 与 context 是否可用，以及现有服务配置是否将进程降权；Compose 模式默认不挂载宿主机 Docker socket。"],
       docker_cli_missing: ["未找到 Docker CLI", "原生部署请先安装 Docker CLI。默认容器镜像未启用宿主机 Docker 管理。"],
       docker_daemon_unavailable: ["无法连接 Docker 服务", "请检查 Docker 服务是否正在运行，以及面板使用的 Docker context 是否正确。"],
     };
@@ -225,7 +231,19 @@ async function loadFiles(path, generation = state.generation) {
 function renderFiles(truncated) {
   const segments = state.path ? state.path.split("/") : [];
   const breadcrumbs = `<button data-folder="">${icon("folder")} 文件根目录</button>${segments.map((name, index) => `<span>/</span><button data-folder="${escapeHTML(segments.slice(0, index + 1).join("/"))}">${escapeHTML(name)}</button>`).join("")}`;
-  $("view").innerHTML = `<div class="section-note">管理范围：<span class="mono">${escapeHTML(state.session.file_root)}</span>。文本编辑与上传上限 256 KiB，下载上限 8 MiB，符号链接不可访问。</div><section class="panel"><div class="toolbar"><div class="folder-path">${breadcrumbs}</div><div class="toolbar-group"><button class="button secondary small" data-new-folder>${icon("plus")}文件夹</button><button class="button secondary small" data-upload>${icon("upload")}上传文本</button><input id="file-upload" type="file" hidden><button class="button primary small" data-new-file>${icon("plus")}新建文件</button></div></div><div class="table-scroll"><table><thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead><tbody>${state.path ? `<tr><td colspan="4"><button class="text-button" data-folder="${escapeHTML(segments.slice(0, -1).join("/"))}">↰ 返回上级目录</button></td></tr>` : ""}${state.entries.map((entry, index) => `<tr><td><div class="entry-name">${icon(entry.directory ? "folder" : "file", entry.directory ? "" : "file-icon")}${entry.linked ? `<span>${escapeHTML(entry.name)} <span class="badge neutral">链接 · 不可访问</span></span>` : `<button class="text-button" data-entry="${index}" title="${escapeHTML(entry.name)}">${escapeHTML(entry.name)}</button>`}</div></td><td class="mono cell-secondary">${entry.directory ? "—" : bytes(entry.size)}</td><td class="cell-secondary">${timestamp(entry.modified)}</td><td>${!entry.directory && !entry.linked ? `<a class="button ghost small" href="/api/files/download?path=${encodeURIComponent(joinPath(entry.name))}" download>${icon("download")}下载</a>` : "—"}</td></tr>`).join("")}</tbody></table></div>${state.entries.length ? "" : empty("这里还很安静", "新建文件或上传 UTF-8 文本，开始整理工作目录。")}<div class="table-footer"><span>${state.entries.length} 个项目${truncated ? " · 目录过大，仅显示前 2,000 项" : ""}</span><span>原子保存 · 版本冲突检查</span></div></section>`;
+  const canFollowLinks = state.session.full_host;
+  const linkCopy = canFollowLinks ? "符号链接仅跟随根目录内的目标。" : "符号链接不可访问。";
+  const entries = state.entries.map((entry, index) => {
+    const unavailable = entry.linked && !canFollowLinks;
+    const name = unavailable
+      ? `<span>${escapeHTML(entry.name)} <span class="badge neutral">链接 · 不可访问</span></span>`
+      : `<button class="text-button" data-entry="${index}" title="${escapeHTML(entry.name)}">${escapeHTML(entry.name)}${entry.linked ? ' <span class="badge neutral">符号链接</span>' : ""}</button>`;
+    const download = !entry.directory && !unavailable
+      ? `<a class="button ghost small" href="/api/files/download?path=${encodeURIComponent(joinPath(entry.name))}" download>${icon("download")}下载</a>`
+      : "—";
+    return `<tr><td><div class="entry-name">${icon(entry.directory ? "folder" : "file", entry.directory ? "" : "file-icon")}${name}</div></td><td class="mono cell-secondary">${entry.directory ? "—" : bytes(entry.size)}</td><td class="cell-secondary">${timestamp(entry.modified)}</td><td>${download}</td></tr>`;
+  }).join("");
+  $("view").innerHTML = `<div class="section-note">管理范围：<span class="mono">${escapeHTML(state.session.file_root)}</span>。文本编辑与上传上限 256 KiB，下载上限 8 MiB。${linkCopy}</div><section class="panel"><div class="toolbar"><div class="folder-path">${breadcrumbs}</div><div class="toolbar-group"><button class="button secondary small" data-new-folder>${icon("plus")}文件夹</button><button class="button secondary small" data-upload>${icon("upload")}上传文本</button><input id="file-upload" type="file" hidden><button class="button primary small" data-new-file>${icon("plus")}新建文件</button></div></div><div class="table-scroll"><table><thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead><tbody>${state.path ? `<tr><td colspan="4"><button class="text-button" data-folder="${escapeHTML(segments.slice(0, -1).join("/"))}">↰ 返回上级目录</button></td></tr>` : ""}${entries}</tbody></table></div>${state.entries.length ? "" : empty("这里还很安静", "新建文件或上传 UTF-8 文本，开始整理工作目录。")}<div class="table-footer"><span>${state.entries.length} 个项目${truncated ? " · 目录过大，仅显示前 2,000 项" : ""}</span><span>原子保存 · 版本冲突检查</span></div></section>`;
 }
 
 function joinPath(name) { return state.path ? `${state.path}/${name}` : name; }
@@ -364,12 +382,19 @@ function renderTerminal() {
   $("view").innerHTML = `<div class="terminal-layout"><section class="terminal-window"><div class="terminal-titlebar"><span class="terminal-dots"><i></i><i></i><i></i></span><span>diagnostics @ ${escapeHTML(state.metrics?.hostname || "localhost")}</span><span>只读诊断</span></div><pre id="terminal-output" role="log" aria-label="诊断输出" tabindex="0"></pre><form id="terminal-form" class="terminal-input"><label for="terminal-command">❯</label><input id="terminal-command" autocomplete="off" spellcheck="false" placeholder="输入命令，例如 uptime"><button class="button primary small" type="submit">执行</button></form></section><aside class="panel terminal-help"><h3>常用诊断命令</h3><p>点击命令即可执行。这里只运行预设诊断，不支持 Shell、管道、脚本或系统修改。</p><div class="commands">${["help", "hostname", "whoami", "uptime", "df -h", "free -h", "ps", "docker ps"].map((command) => `<button class="command-chip" data-command="${command}">${command}<span>↵</span></button>`).join("")}</div><p>使用 ↑ / ↓ 查看本次会话的命令历史。</p></aside></div>`;
   $("terminal-output").textContent = state.terminal;
   $("terminal-output").scrollTop = $("terminal-output").scrollHeight;
+  if (state.session?.full_host) {
+    const root = state.session.full_host_root;
+    document.querySelector(".terminal-titlebar span:last-child").textContent = root ? "root 权限 Shell" : "全主机 Shell";
+    $("terminal-command").placeholder = root ? "输入主机命令（root 权限）" : "输入主机命令（服务账户权限）";
+    document.querySelector(".terminal-help p").textContent = `命令以${root ? "root" : "面板服务账户"}身份在 VPS 执行，可修改或删除该账户有权限访问的文件、服务和数据。每条命令最多运行 30 秒，输出上限 1 MiB。请谨慎操作。`;
+  }
 }
 
 async function runCommand(command) {
   if (!command || terminalBusy || !$("terminal-form")) return;
   terminalBusy = true;
   const session = state.session;
+  const generation = state.generation;
   const form = $("terminal-form");
   form.dataset.busy = "true";
   form.querySelector("button").disabled = true;
@@ -381,15 +406,17 @@ async function runCommand(command) {
   update();
   try {
     const result = await api("terminal", { method: "POST", body: { command } });
-    state.terminal += `${result.output}\n\n`;
-  } catch (error) { if (session === state.session) state.terminal += `Error: ${error.message}\n\n`; }
+    if (session === state.session && generation === state.generation) state.terminal += `${result.output}${result.exit_code && result.exit_code !== 0 ? `\n[退出码: ${result.exit_code}]` : ""}\n\n`;
+  } catch (error) { if (session === state.session && generation === state.generation) state.terminal += `Error: ${error.message}\n\n`; }
   finally {
     terminalBusy = false;
-    state.terminal = state.terminal.slice(-100000);
-    update();
-    const currentForm = $("terminal-form");
-    if (currentForm) { currentForm.dataset.busy = "false"; currentForm.querySelector("button").disabled = false; }
-    $("terminal-command")?.focus();
+    if (session === state.session && generation === state.generation) {
+      state.terminal = state.terminal.slice(-100000);
+      update();
+      const currentForm = $("terminal-form");
+      if (currentForm) { currentForm.dataset.busy = "false"; currentForm.querySelector("button").disabled = false; }
+      $("terminal-command")?.focus();
+    }
   }
 }
 
@@ -414,7 +441,16 @@ function renderAudit() {
 
 function renderInfo() {
   const m = state.metrics;
-  $("view").innerHTML = `<div class="info-grid"><section class="panel"><h2>当前主机</h2><dl class="host-details">${detail("主机名称", m.hostname, true)}${detail("系统", `${m.platform} ${m.release}`)}${detail("处理器", m.cpu_name)}${detail("架构 / 核心", `${m.architecture} / ${m.cpu_count}`)}${detail("物理内存", bytes(m.memory.total))}${detail("系统负载", m.load ? m.load.map((value) => value.toFixed(2)).join(" / ") : "此平台不提供 load average")}${detail("累计接收 / 发送", `${bytes(m.network.received_total)} / ${bytes(m.network.sent_total)}`)}</dl></section><section class="panel"><h2>工作台配置</h2><dl class="host-details">${detail("版本", `Harbor Panel ${state.session.version}`)}${detail("管理模式", "单主机 · 单管理员")}${detail("文件根目录", state.session.file_root, true)}${detail("会话有效期", "8 小时，服务重启后失效")}${detail("监控采样", "2 秒 / 内存保留 90 个点")}${detail("文件编辑", "UTF-8 / 256 KiB / 版本检查")}${detail("会话与请求保护", "HttpOnly Cookie / SameSite / CSRF")}</dl></section><section class="panel info-wide"><h2>从这里继续扩展</h2><p>这是独立实现的核心运维版本，所有已显示指标来自当前运行主机。Docker 需要本机安装 CLI 并能够访问对应 daemon；面板进程只能使用其操作系统账户已有的权限。</p><ul><li>当前支持：监控、进程查看、目录浏览、UTF-8 文件创建/编辑/上传、文件下载、容器启停/重启/日志、诊断与审计。</li><li>尚未实现：远程节点、网站与证书管理、应用市场、交互式 SSH / PTY、AI 助手和桌面窗口系统。</li><li>首次运行需使用一次性凭证注册管理员账户；部署时可通过 --root 指定文件目录。外部访问应配置 HTTPS 反向代理和 --public-origin。</li></ul><p>完整启动、测试与 Linux systemd 部署说明见项目目录中的 README.md。</p></section></div>`;
+  const accessMode = state.session.full_host_root ? "全主机 root · 单管理员" : state.session.full_host ? "全主机 · 服务账户权限" : "受限文件目录 · 单管理员";
+  const terminalDescription = state.session.full_host_root
+    ? "原生 root Shell，可管理 VPS 文件、Docker 和系统命令。"
+    : state.session.full_host
+      ? "全主机路径访问与 Shell，权限受面板服务操作系统账户限制。"
+      : "预设只读诊断；没有通用 Shell 或宿主机 Docker socket。";
+  const proxyAdvice = state.session.public_http
+    ? "公网 HTTP 未加密；限制来源 IP，或自行配置 Nginx 与 HTTPS。"
+    : "需要域名访问时可自行配置 Nginx 与 HTTPS 反向代理。";
+  $("view").innerHTML = `<div class="info-grid"><section class="panel"><h2>当前主机</h2><dl class="host-details">${detail("主机名称", m.hostname, true)}${detail("系统", `${m.platform} ${m.release}`)}${detail("处理器", m.cpu_name)}${detail("架构 / 核心", `${m.architecture} / ${m.cpu_count}`)}${detail("物理内存", bytes(m.memory.total))}${detail("系统负载", m.load ? m.load.map((value) => value.toFixed(2)).join(" / ") : "此平台不提供 load average")}${detail("累计接收 / 发送", `${bytes(m.network.received_total)} / ${bytes(m.network.sent_total)}`)}</dl></section><section class="panel"><h2>工作台配置</h2><dl class="host-details">${detail("版本", `Harbor Panel ${state.session.version}`)}${detail("管理模式", accessMode)}${detail("文件根目录", state.session.file_root, true)}${detail("会话有效期", "8 小时，服务重启后失效")}${detail("监控采样", "2 秒 / 内存保留 90 个点")}${detail("文件编辑", "UTF-8 / 256 KiB / 版本检查")}${detail("会话与请求保护", "HttpOnly Cookie / SameSite / CSRF")}</dl></section><section class="panel info-wide"><h2>从这里继续扩展</h2><p>这是独立实现的核心运维版本，所有已显示指标来自当前运行主机。${terminalDescription}Docker CLI 与 daemon 需安装并运行；是否能管理容器取决于服务实际权限。${proxyAdvice}</p><ul><li>当前支持：监控、进程查看、目录浏览、UTF-8 文件创建/编辑/上传、文件下载、容器启停/重启/日志、终端与审计。</li><li>尚未实现：远程节点、网站与证书管理、应用市场、交互式 SSH / PTY、AI 助手和桌面窗口系统。</li><li>管理员账户每次安装仅注册一次；更新保留账户，卸载后旧凭证和账户失效。</li></ul><p>完整启动、测试与 Linux systemd 部署说明见项目目录中的 README.md。</p></section></div>`;
 }
 
 function searchViews() {
@@ -453,12 +489,33 @@ async function poll() {
 }
 
 async function enterApp() {
-  state.session = await api("session");
-  state.csrf = state.session.csrf;
+  const session = await api("session");
+  state.session = session;
+  state.csrf = session.csrf;
+  if (session.full_host) {
+    state.terminal = session.full_host_root
+      ? "Harbor root shell · 命令以 root 身份在 VPS 执行。每条命令最多 30 秒，输出上限 1 MiB。\n\n"
+      : "Harbor full-host shell · 命令以面板服务账户权限执行。每条命令最多 30 秒，输出上限 1 MiB。\n\n";
+    let warning = $("security-warning");
+    if (!warning) {
+      warning = document.createElement("p");
+      warning.id = "security-warning";
+      warning.className = "security-banner";
+      warning.setAttribute("role", "alert");
+      $("main").prepend(warning);
+    }
+    const privilegeWarning = session.full_host_root
+      ? "本面板以 root 运行，可完全控制 VPS 文件、Docker 和系统命令。"
+      : "此模式允许浏览全主机路径，但实际操作仅具有面板服务账户的权限。";
+    warning.textContent = `高权限主机管理：${privilegeWarning}${session.public_http ? "公网 HTTP 未加密，密码和会话可能被窃听；请限制端口来源，或自行配置 Nginx 与 HTTPS。" : "请仅通过可信网络访问，并妥善保管管理员凭证。"}`;
+  } else {
+    $("security-warning")?.remove();
+  }
   $("login").hidden = true;
   $("boot").hidden = true;
   $("app").hidden = false;
   await navigate();
+  if (state.session !== session) return;
   await poll();
 }
 

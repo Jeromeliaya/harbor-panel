@@ -7,6 +7,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -19,9 +20,12 @@ from files import PanelError
 
 class Host:
     COMMANDS = ("help", "hostname", "whoami", "uptime", "df -h", "free -h", "ps", "docker ps")
+    COMMAND_TIMEOUT = 30
+    MAX_COMMAND_OUTPUT = 1024 * 1024
 
-    def __init__(self, disk_path):
+    def __init__(self, disk_path, full_host=False):
         self.disk_path = str(disk_path)
+        self.full_host = full_host
         self.lock = threading.Lock()
         self.history = deque(maxlen=90)
         self.stop = threading.Event()
@@ -287,7 +291,16 @@ class Host:
         return {"output": self.docker_command("logs", "--tail", "150", "--timestamps", container)}
 
     def terminal(self, command):
-        if not isinstance(command, str) or command.strip() not in self.COMMANDS:
+        if not isinstance(command, str):
+            raise PanelError("Enter a command.")
+        if self.full_host:
+            if not command.strip() or "\x00" in command or len(command) > 4096:
+                raise PanelError("Commands must contain 1 to 4096 characters and no null bytes.")
+            if command.strip() == "help":
+                identity = "the root account" if hasattr(os, "geteuid") and os.geteuid() == 0 else "the service account"
+                return {"command": command, "output": f"Full-host shell command runner. Commands execute as {identity}; use standard shell syntax.", "exit_code": 0}
+            return self.run_command(command)
+        if command.strip() not in self.COMMANDS:
             raise PanelError("Unsupported command. Enter 'help' to see available diagnostics.")
         command = command.strip()
         metrics = self.metrics()
@@ -310,6 +323,81 @@ class Host:
         else:
             output = self.docker_command("ps")
         return {"command": command, "output": output}
+
+    def run_command(self, command):
+        if os.name == "nt":
+            arguments = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command]
+            process_options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        else:
+            arguments = ["/bin/sh", "-c", command]
+            process_options = {"start_new_session": True}
+        process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False, **process_options)
+        chunks = []
+        reader_errors = []
+        too_large = threading.Event()
+
+        def terminate_tree():
+            if os.name == "nt":
+                try:
+                    result = subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5)
+                except subprocess.TimeoutExpired:
+                    if process.poll() is None:
+                        process.kill()
+                    return
+                if result.returncode and process.poll() is None:
+                    process.kill()
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        def collect():
+            size = 0
+            try:
+                with process.stdout:
+                    while True:
+                        chunk = process.stdout.read(16384)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > self.MAX_COMMAND_OUTPUT and not too_large.is_set():
+                            too_large.set()
+                            terminate_tree()
+                        elif not too_large.is_set():
+                            chunks.append(chunk)
+            except OSError as exc:
+                reader_errors.append(exc)
+
+        reader = threading.Thread(target=collect, name="harbor-command-output", daemon=True)
+        reader.start()
+        try:
+            process.wait(timeout=self.COMMAND_TIMEOUT)
+        except subprocess.TimeoutExpired as exc:
+            terminate_tree()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired as cleanup_error:
+                    raise PanelError("Command process could not be stopped after timeout.", 502) from cleanup_error
+            reader.join(timeout=2)
+            if reader.is_alive():
+                raise PanelError("Command output stream did not close after timeout cleanup.", 502) from exc
+            raise PanelError(f"Command timed out after {self.COMMAND_TIMEOUT} seconds.", 504) from exc
+        reader.join(timeout=2)
+        if reader.is_alive():
+            terminate_tree()
+            reader.join(timeout=2)
+            if reader.is_alive():
+                raise PanelError("Command output stream did not close after child processes were stopped.", 502)
+        if too_large.is_set():
+            raise PanelError("Command output exceeded 1 MiB.", 413)
+        if reader_errors:
+            raise PanelError(f"Could not read command output: {reader_errors[0]}", 502)
+        return {"command": command, "output": b"".join(chunks).decode("utf-8", errors="replace"), "exit_code": process.returncode}
 
     def close(self):
         self.stop.set()

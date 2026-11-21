@@ -160,11 +160,16 @@ class PanelServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, password, root, state_dir, public_origin=None, bootstrap_token_file=None):
-        self.files = FileStore(root)
+    def __init__(self, address, password, root, state_dir, public_origin=None, bootstrap_token_file=None, full_host=False):
         state = Path(state_dir).resolve()
-        if state.is_relative_to(self.files.root):
+        file_root = Path(root).resolve()
+        bootstrap = Path(bootstrap_token_file).resolve() if bootstrap_token_file else None
+        if state.is_relative_to(file_root) and not full_host:
             raise ValueError("The state directory must be outside the managed file root.")
+        protected_paths = (state, bootstrap) if full_host and bootstrap else ((state,) if full_host else ())
+        self.files = FileStore(file_root, protected_paths=protected_paths, allow_symlinks=full_host)
+        self.full_host = full_host
+        self.full_host_root = full_host and hasattr(os, "geteuid") and os.geteuid() == 0
         self.auth = Auth(password if not bootstrap_token_file else None, bootstrap_token_file, state)
         self.audit = Audit(state)
         self.workers = threading.BoundedSemaphore(32)
@@ -182,7 +187,7 @@ class PanelServer(ThreadingHTTPServer):
             self.secure_cookie = True
         self.allowed_hosts = {urlsplit(origin).netloc.lower() for origin in self.origins}
         try:
-            self.host = Host(self.files.root)
+            self.host = Host(self.files.root, full_host=full_host)
         except Exception:
             self.server_close()
             raise
@@ -206,13 +211,40 @@ class PanelServer(ThreadingHTTPServer):
         finally:
             self.workers.release()
 
+    @staticmethod
+    def has_registered_administrator(state_dir):
+        auth_path = Path(state_dir) / "auth.sqlite3"
+        if not auth_path.is_file():
+            return False
+        with closing(sqlite3.connect(auth_path)) as connection:
+            table = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='administrator'").fetchone()
+            if not table:
+                return False
+            return connection.execute("SELECT 1 FROM administrator WHERE id=1").fetchone() is not None
+
+    @classmethod
+    def prepare_bootstrap_token(cls, state_dir):
+        if cls.has_registered_administrator(state_dir):
+            return None
+        token_file = Path(state_dir) / "bootstrap.token"
+        token_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+                stream.write(base64.b64encode(secrets.token_bytes(32)).decode("ascii"))
+        os.chmod(token_file, 0o600)
+        return token_file
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "HarborPanel/0.1"
 
     def setup(self):
         super().setup()
-        self.connection.settimeout(20)
+        self.connection.settimeout(60)
 
     def log_message(self, format, *args):
         LOG.info("%s %s %s", self.client_address[0], self.command, urlsplit(self.path).path)
@@ -228,8 +260,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'")
-        if self.server.secure_cookie:
-            self.send_header("Strict-Transport-Security", "max-age=31536000")
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -292,9 +322,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise PanelError("Cross-site requests are not allowed.", 403)
             origin = self.headers.get("Origin")
             public_origin = f"http://{host}"
-            if origin and origin not in self.server.origins and not (self.server.public_bind and origin == public_origin):
+            if origin and origin not in self.server.origins and not (self.server.public_bind and not self.server.secure_cookie and origin == public_origin):
                 raise PanelError("Origin is not allowed.", 403)
-            if mutation and origin not in self.server.origins and not (self.server.public_bind and origin == public_origin):
+            if mutation and origin not in self.server.origins and not (self.server.public_bind and not self.server.secure_cookie and origin == public_origin):
                 raise PanelError("An allowed Origin header is required.", 403)
             parsed = urlsplit(self.path)
             path = parsed.path
@@ -302,7 +332,7 @@ class Handler(BaseHTTPRequestHandler):
             relative = query.get("path", [""])[0]
             address = self.client_address[0]
             if path == "/api/setup" and self.command == "GET":
-                self._respond(200, {"required": self.server.auth.setup_required()})
+                self._respond(200, {"required": self.server.auth.setup_required(), "full_host": self.server.full_host, "full_host_root": self.server.full_host_root, "public_http": self.server.public_bind and not self.server.secure_cookie})
                 return
             if path == "/api/login" and self.command == "POST":
                 body = self._body()
@@ -363,7 +393,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _get_api(self, path, relative, query, session):
         if path == "/api/session":
-            result = {"csrf": session["csrf"], "version": "0.1.0", "file_root": str(self.server.files.root), "platform": os.name, "commands": list(Host.COMMANDS)}
+            result = {"csrf": session["csrf"], "version": "0.1.0", "file_root": str(self.server.files.root), "platform": os.name, "commands": list(Host.COMMANDS), "full_host": self.server.full_host, "full_host_root": self.server.full_host_root, "public_http": self.server.public_bind and not self.server.secure_cookie}
         elif path == "/api/metrics":
             result = self.server.host.metrics()
         elif path == "/api/processes":
@@ -395,6 +425,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         target = body.get("path", body.get("id", body.get("command", "administrator")))
         action = path.removeprefix("/api/").replace("/", ".")
+        if path == "/api/terminal" and self.server.full_host:
+            target = "host shell command"
         if path == "/api/containers/action":
             target = f"{body.get('action', '')}:{body.get('id', '')}"
         elif path == "/api/containers/config":
@@ -422,7 +454,8 @@ class Handler(BaseHTTPRequestHandler):
         except (PanelError, OSError):
             self.server.audit.add(action, target, address, False)
             raise
-        self.server.audit.add(action, target, address)
+        success = not (path == "/api/terminal" and result.get("exit_code", 0) != 0)
+        self.server.audit.add(action, target, address, success)
         headers = {"Set-Cookie": self._cookie("", expired=True)} if path == "/api/logout" else None
         self._respond(200, result, headers=headers)
 
@@ -435,19 +468,14 @@ def main():
     parser.add_argument("--state-dir", type=Path, default=BASE / ".state")
     parser.add_argument("--public-origin", help="HTTPS origin when deployed behind a trusted reverse proxy")
     parser.add_argument("--bootstrap-token-file", type=Path, help="One-time administrator registration credential file")
+    parser.add_argument("--full-host", action="store_true", help="Grant file and terminal APIs full host access; use only for trusted administrators")
     args = parser.parse_args()
     password = os.environ.get("HARBOR_PASSWORD")
     if not args.bootstrap_token_file and not password:
-        token_file = Path(args.state_dir) / "bootstrap.token"
-        if not token_file.exists():
-            token_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            credential = secrets.token_bytes(32)
-            token_file.write_text(base64.b64encode(credential).decode("ascii"), encoding="ascii")
-            os.chmod(token_file, 0o600)
-        args.bootstrap_token_file = token_file
+        args.bootstrap_token_file = PanelServer.prepare_bootstrap_token(args.state_dir)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        server = PanelServer((args.host, args.port), password, args.root, args.state_dir, args.public_origin, args.bootstrap_token_file)
+        server = PanelServer((args.host, args.port), password, args.root, args.state_dir, args.public_origin, args.bootstrap_token_file, args.full_host)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     display_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host

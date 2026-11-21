@@ -2,10 +2,10 @@
 
 name="Harbor Panel"
 description="Harbor Panel single-host operations workspace"
-directory="/opt/harbor-panel"
-command="/opt/harbor-panel/.venv/bin/python"
+directory="/"
+command="${HARBOR_PANEL_DIR:-/opt/harbor-panel}/.venv/bin/python"
 command_args=""
-command_user="harbor:harbor"
+command_user="root:root"
 command_background=true
 pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/harbor-panel.log"
@@ -13,11 +13,18 @@ error_log="/var/log/harbor-panel.log"
 export PYTHONDONTWRITEBYTECODE=1
 
 start_pre() {
+    if [ -r /etc/harbor-panel.paths ]; then
+        . /etc/harbor-panel.paths
+    fi
     if [ -r /etc/harbor-panel.port ]; then
         . /etc/harbor-panel.port
         export HARBOR_PANEL_PORT
     fi
-    command_args="/opt/harbor-panel/server.py --host 0.0.0.0 --port ${HARBOR_PANEL_PORT:-8088} --root /srv/harbor-workspace --state-dir /var/lib/harbor-panel --bootstrap-token-file /var/lib/harbor-panel/bootstrap.token"
+    app_dir=${HARBOR_PANEL_DIR:-/opt/harbor-panel}
+    state_dir=${HARBOR_PANEL_STATE:-/var/lib/harbor-panel}
+    directory=/
+    command="$app_dir/.venv/bin/python"
+    command_args="$app_dir/server.py --host 0.0.0.0 --port ${HARBOR_PANEL_PORT:-8088} --root / --state-dir $state_dir --bootstrap-token-file $state_dir/bootstrap.token --full-host"
 }
 
 depend() {
