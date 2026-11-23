@@ -11,10 +11,13 @@
   <link rel="stylesheet" href="/vendor/xterm.css">
   <script src="/vendor/xterm.js" defer></script>
   <script src="/vendor/xterm-addon-fit.js" defer></script>
+  <script src="/security-settings.js" defer></script>
+  <script src="/host-settings.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
   <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h5m4 0h7M4 17h9m4 0h3"/><circle cx="11" cy="7" r="2"/><circle cx="15" cy="17" r="2"/></symbol>
     <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></symbol>
     <symbol id="i-server" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 6.5h.01M7 17.5h.01M12 6.5h5M12 17.5h5"/></symbol>
     <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/><path d="M3 9h18"/></symbol>
@@ -45,7 +48,7 @@
 
   <section id="login" class="login-screen" hidden>
     <div class="login-story"><a class="brand" href="/"><span class="brand-mark">H<span>·</span></span>harbor<span class="brand-panel">panel</span></a><div><p class="eyebrow">YOUR SERVER. YOUR WORKSPACE.</p><h1>让运维，<br>从容一点。</h1><p>实时洞察主机状态，在一个安静、有序的工作台里，<br>完成每一天的管理。</p><div class="login-features"><span>实时监控</span><span>文件管理</span><span>容器运维</span></div></div><span class="login-foot">独立构建 · 轻量运行 · 真实主机</span></div>
-    <div class="login-form-wrap"><form id="login-form" class="login-form"><div class="small-logo">H<span>·</span></div><p class="eyebrow">WELCOME TO HARBOR</p><h2 id="auth-title">登录你的工作台</h2><p id="auth-description" class="muted">使用管理员账户登录。</p><div id="registration-fields" hidden><label for="credential">一次性凭证（Base64）</label><input id="credential" type="password" autocomplete="one-time-code" maxlength="256" placeholder="粘贴安装时显示的凭证"><label for="new-username">管理员用户名</label><input id="new-username" autocomplete="username" maxlength="64" placeholder="设置管理员用户名"><label for="new-password">管理员密码</label><input id="new-password" type="password" autocomplete="new-password" maxlength="1024" placeholder="至少 12 个字符"><label for="confirm-password">确认密码</label><input id="confirm-password" type="password" autocomplete="new-password" maxlength="1024" placeholder="再次输入管理员密码"></div><div id="login-fields"><label for="username">管理员用户名</label><input id="username" autocomplete="username" maxlength="64" placeholder="输入管理员用户名"><label for="password">管理员密码</label><input id="password" type="password" autocomplete="current-password" required maxlength="1024" placeholder="输入管理员密码"></div><p id="login-error" class="error-text" role="alert"></p><button id="auth-submit" class="button primary login-submit" type="submit">进入工作台 <span aria-hidden="true">↗</span></button><p id="login-hint" class="login-hint">首次运行请先完成管理员注册。</p></form></div>
+    <div class="login-form-wrap"><form id="login-form" class="login-form"><div class="small-logo">H<span>·</span></div><p class="eyebrow">WELCOME TO HARBOR</p><h2 id="auth-title">登录你的工作台</h2><p id="auth-description" class="muted">使用管理员账户登录。</p><div id="registration-fields" hidden><label for="credential">一次性凭证（Base64）</label><input id="credential" type="password" autocomplete="one-time-code" maxlength="256" placeholder="粘贴安装时显示的凭证"><label for="new-username">管理员用户名</label><input id="new-username" autocomplete="username" maxlength="64" placeholder="设置管理员用户名"><label for="new-password">管理员密码</label><input id="new-password" type="password" autocomplete="new-password" maxlength="1024" placeholder="至少 12 个字符"><label for="confirm-password">确认密码</label><input id="confirm-password" type="password" autocomplete="new-password" maxlength="1024" placeholder="再次输入管理员密码"></div><div id="login-fields"><label for="username">管理员用户名</label><input id="username" autocomplete="username" maxlength="64" placeholder="输入管理员用户名"><label for="password">管理员密码</label><input id="password" type="password" autocomplete="current-password" required maxlength="1024" placeholder="输入管理员密码"></div><p id="login-error" class="error-text" role="alert"></p><button id="auth-submit" class="button primary login-submit" type="submit">进入工作台 <span aria-hidden="true">↗</span></button><p id="login-hint" class="login-hint">首次运行请先完成管理员注册。</p></form><div id="login-verification" class="login-form" hidden></div></div>
   </section>
 
   <div id="app" class="app" hidden>
@@ -85,7 +88,8 @@
           <p id="site-upstream-help" class="muted"></p>
           <p id="site-exposure-warning" class="site-warning">反代可能将本机或内网服务暴露到公网。请确认该服务允许公开，并已配置必要的访问控制。</p>
           <section id="site-scan" class="site-scan" aria-labelledby="site-scan-title" hidden>
-            <div class="site-scan-heading"><div><h3 id="site-scan-title">本机 Web 服务</h3><p class="muted">读取 TCP 监听端口；点选结果填入上游地址。扫描不会验证端口上是否提供 HTTP 服务。</p></div><button id="site-scan-button" type="button" class="button secondary"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>扫描本机服务</button></div>
+            <div class="site-scan-heading"><div><h3 id="site-scan-title">本机 Web 服务</h3><p class="muted">跳过 SSH、邮件和常见系统服务，不发送 HTTP 探测请求。点选应用可填入上游地址。</p></div><button id="site-scan-button" type="button" class="button secondary"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>扫描本机服务</button></div>
+            <div id="site-scan-panel" class="site-scan-option" hidden><strong>Harbor Panel 本机监听</strong><span id="site-scan-panel-port" class="badge neutral"></span><small>仅供查看，不可作为网站上游。</small></div>
             <p id="site-scan-status" class="muted" role="status" hidden></p><ul id="site-scan-results" class="site-scan-results" hidden></ul>
           </section>
         </div>

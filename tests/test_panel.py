@@ -199,6 +199,89 @@ class HTTPTests(unittest.TestCase):
                 self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
         self.assertEqual(self.request("GET", "/server.py")[0], 404)
 
+    def test_listener_requires_session_csrf_and_password(self):
+        path = "/api/host-settings/change"
+        body = {"kind": "panel", "port": 8089, "firewall_ready": True}
+        self.assertEqual(self.request("GET", "/api/host-settings")[0], 401)
+        self.assertEqual(self.request("POST", path, body)[0], 401)
+        self.login()
+        with mock.patch.object(self.server.host_settings, "start", return_value={"status": "queued"}) as start:
+            self.assertEqual(self.request("POST", path, body, {"X-CSRF-Token": ""})[0], 403)
+            self.assertEqual(self.request("POST", path, {**body, "password": "wrong"})[0], 403)
+            start.assert_not_called()
+            self.assertEqual(self.request("POST", path, {**body, "password": "test-password-long-enough"})[0], 202)
+            start.assert_called_once_with("panel", 8089, firewall_ready=True)
+
+    def test_https_totp_scoped_listener_verification_and_local_health(self):
+        import pyotp
+        from host_settings import HEALTH_PATH
+
+        server = self.server
+        origin = "https://panel.example.test"
+        host = "panel.example.test"
+        headers = {"Host": host, "Origin": origin, "X-Forwarded-Proto": "https"}
+        guest = {"username": "administrator", "password": "test-password-long-enough"}
+        change = {"kind": "panel", "port": 8089, "firewall_ready": True}
+        with mock.patch.multiple(server, secure_cookie=True, public_origin=origin, rp_id=host,
+                                 allowed_hosts={host}, origins={origin}):
+            try:
+                status, login, cookie = self.request("POST", "/api/login", guest, headers)
+                self.assertEqual(status, 200)
+                self.cookie, self.csrf = cookie["Set-Cookie"].split(";", 1)[0], login["csrf"]
+                status, grant, _ = self.request("POST", "/api/mfa/reauth", guest, headers)
+                self.assertEqual(status, 200)
+                self.assertEqual(self.request("POST", "/api/host-settings/change", {**change, **grant}, headers)[0], 403)
+                status, draft, _ = self.request("POST", "/api/mfa/enroll/start", {**grant, "method": "totp"}, headers)
+                self.assertEqual(status, 200)
+                totp = pyotp.TOTP(draft["secret"])
+                with mock.patch("mfa.time.time", return_value=1_800_000_000):
+                    status, result, _ = self.request("POST", "/api/mfa/enroll/finish", {"enrollment_id": draft["enrollment_id"], "code": totp.at(1_800_000_000)}, headers)
+                    self.assertEqual((status, result), (200, {"signed_out": True}))
+                self.assertEqual(self.request("GET", "/api/session", headers=headers)[0], 401)
+                self.cookie = self.csrf = ""
+                self.assertEqual(self.request("POST", "/api/login", guest, {**headers, "X-Forwarded-Proto": "http"})[0], 403)
+                status, flow, issued = self.request("POST", "/api/login", guest, headers)
+                self.assertEqual(status, 202)
+                self.assertNotIn("Set-Cookie", issued)
+                path = "/api/login/mfa/verify"
+                factors = {"method": "totp", "challenge": flow["challenge"]}
+                with mock.patch("mfa.time.time", return_value=1_800_000_060):
+                    self.assertEqual(self.request("POST", path, {**factors, "code": totp.at(1_800_000_000)}, headers)[0], 403)
+                    status, login, cookie = self.request("POST", path, {**factors, "code": totp.at(1_800_000_060)}, headers)
+                    self.assertEqual(status, 200)
+                self.cookie, self.csrf = cookie["Set-Cookie"].split(";", 1)[0], login["csrf"]
+                status, flow, _ = self.request("POST", "/api/mfa/reauth", {**guest, "scope": "listener"}, headers)
+                self.assertEqual(status, 200)
+                self.assertNotIn("grant", flow)
+                with mock.patch("mfa.time.time", return_value=1_800_000_120):
+                    status, grant, _ = self.request("POST", "/api/mfa/reauth/verify", {"challenge": flow["challenge"], "method": "totp", "code": totp.at(1_800_000_120), "scope": "mfa"}, headers)
+                self.assertEqual(status, 200)
+                self.assertEqual(self.request("POST", "/api/mfa/remove", {**grant, "method": "totp"}, headers)[0], 403)
+                with mock.patch.object(server.host_settings, "start", return_value={"status": "queued"}) as start:
+                    self.assertEqual(self.request("POST", "/api/host-settings/change", {**change, **guest}, headers)[0], 410)
+                    self.assertEqual(self.request("POST", "/api/host-settings/change", {**change, **grant}, headers)[0], 202)
+                    self.assertEqual(self.request("POST", "/api/host-settings/change", {**change, **grant}, headers)[0], 410)
+                    start.assert_called_once()
+                status, events, _ = self.request("GET", "/api/audit", headers=headers)
+                self.assertEqual(status, 200)
+                serialized = json.dumps(events)
+                self.assertIn("listener.change.requested", serialized)
+                for secret in (guest["password"], draft["secret"], draft["enrollment_id"],
+                               flow["challenge"], grant["grant"], totp.at(1_800_000_120)):
+                    self.assertNotIn(secret, serialized)
+                with mock.patch.object(server.host_settings, "health", return_value={"proof": "b" * 64}) as health:
+                    path = f"{HEALTH_PATH}?nonce={'a' * 32}"
+                    local = self.request("GET", path, headers={"Origin": ""})
+                    proxied = self.request("GET", path, headers={**headers, "Origin": ""})
+                    self.assertEqual((local[0], proxied[0]), (200, 200))
+                    self.assertEqual(proxied[2]["Cache-Control"], "no-store")
+                    self.assertEqual(self.request("GET", path, headers={**headers, "Origin": "", "X-Forwarded-Proto": "http"})[0], 404)
+                    self.assertEqual(health.call_count, 2)
+            finally:
+                with server.auth.mfa._db(write=True) as db:
+                    db.execute("DELETE FROM mfa_totp")
+                server.auth.mfa.clear()
+
     def test_website_routes_require_login_and_csrf(self):
         for path in ("", "/environment", "/job", "/scan"):
             self.assertEqual(self.request("GET", "/api/sites" + path)[0], 401)

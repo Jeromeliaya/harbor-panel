@@ -9,12 +9,13 @@ Group=root
 Environment=HARBOR_PANEL_DIR=/opt/harbor-panel
 Environment=HARBOR_PANEL_STATE=/var/lib/harbor-panel
 Environment=HARBOR_PANEL_PORT=8088
+Environment=HARBOR_PANEL_BIND=0.0.0.0
 EnvironmentFile=-/etc/harbor-panel.env
 EnvironmentFile=-/etc/harbor-panel.paths
 EnvironmentFile=-/etc/harbor-panel.port
 Environment=PYTHONDONTWRITEBYTECODE=1
 WorkingDirectory=/
-ExecStart=/bin/sh -c 'exec "$${HARBOR_PANEL_DIR}/.venv/bin/python" "$${HARBOR_PANEL_DIR}/server.py" --host 0.0.0.0 --port "$${HARBOR_PANEL_PORT}" --root / --state-dir "$${HARBOR_PANEL_STATE}" --bootstrap-token-file "$${HARBOR_PANEL_STATE}/bootstrap.token" --full-host'
+ExecStart=/bin/sh -c 'exec "$${HARBOR_PANEL_DIR}/.venv/bin/python" "$${HARBOR_PANEL_DIR}/server.py" --port "$${HARBOR_PANEL_PORT}" --root / --state-dir "$${HARBOR_PANEL_STATE}" --bootstrap-token-file "$${HARBOR_PANEL_STATE}/bootstrap.token" --full-host'
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20

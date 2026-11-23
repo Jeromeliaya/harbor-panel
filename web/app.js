@@ -11,6 +11,7 @@ const views = {
   terminal: { title: "终端", kicker: "INTERACTIVE SSH", description: "通过 SSH 直接操作本机 VPS，或安全连接其他服务器。", icon: "terminal" },
   processes: { title: "进程监控", kicker: "PROCESS MONITOR", description: "查看正在运行的进程，按内存占用排序。", icon: "activity" },
   audit: { title: "操作审计", kicker: "ACTIVITY & AUDIT", description: "每一次登录与管理操作，都有迹可循。", icon: "shield" },
+  settings: { title: "设置", kicker: "SECURITY & ACCESS", description: "管理登录二次验证、系统 SSH 和面板访问端口。", icon: "sliders" },
   appearance: { title: "外观主题", kicker: "YOUR VISUAL SPACE", description: "选择有纹理的配色主题，也可以上传自己的背景图片。", icon: "sun" },
   info: { title: "主机信息", kicker: "HOST INFORMATION", description: "了解当前环境、运行配置与工作台能力。", icon: "server" },
 };
@@ -24,6 +25,36 @@ let terminalSocket = null;
 let terminalResizeObserver = null;
 let terminalConnectRequest = null;
 let appearanceBusy = false;
+let settingsController;
+let loginVerification;
+
+function disposeSettings() {
+  if (!settingsController) return;
+  settingsController.abort();
+  settingsController = undefined;
+  $("view").replaceChildren();
+}
+
+function clearLoginVerification() {
+  loginVerification?.();
+  loginVerification = undefined;
+  $("login-verification").replaceChildren();
+  $("login-verification").hidden = true;
+  $("login-form").hidden = false;
+}
+
+async function openSettings() {
+  const controller = new AbortController();
+  settingsController = controller;
+  $("view").innerHTML = '<div class="settings-stack"><div id="security-settings"></div><div id="host-settings" class="settings-stack"></div></div>';
+  await Promise.all([
+    window.HarborSecuritySettings.mount($("security-settings"), { api, signal: controller.signal, onSignedOut: () => {
+      showLogin();
+      toast("登录验证已更新，请重新登录。");
+    } }),
+    window.HarborHostSettings.mount($("host-settings"), { api, signal: controller.signal }),
+  ]);
+}
 
 function disposeTerminal() {
   if (terminalResizeObserver) terminalResizeObserver.disconnect();
@@ -78,6 +109,8 @@ function toast(message, error = false) {
 }
 
 function showLogin() {
+  clearLoginVerification();
+  disposeSettings();
   disposeTerminal();
   disposeSites();
   sitesMutation = null;
@@ -177,6 +210,7 @@ async function navigate() {
   const nextView = requested === "sites/environment" ? "sites" : Object.hasOwn(views, requested) ? requested : "overview";
   if (state.view === "terminal") disposeTerminal();
   if (state.view === "sites") disposeSites();
+  if (state.view === "settings") disposeSettings();
   state.view = nextView;
   const view = views[state.view];
   const generation = ++state.generation;
@@ -209,6 +243,8 @@ async function navigate() {
       renderContainers();
     } else if (state.view === "sites") {
       await openSites(requested === "sites/environment");
+    } else if (state.view === "settings") {
+      await openSettings();
     } else if (state.view === "terminal") {
       renderTerminal();
     } else if (state.view === "appearance") {
@@ -622,7 +658,7 @@ function updateSiteKind() {
   const upstream = $("site-upstream");
   if (kind !== siteDraft.kind) {
     siteDraft.scan?.abort();
-    Object.assign(siteDraft, { kind, scan: null, services: [], selected: -1, scanStatus: "" });
+    Object.assign(siteDraft, { kind, scan: null, services: [], panelPort: null, selected: -1, scanStatus: "" });
     upstream.value = "";
   }
   siteFormError();
@@ -663,6 +699,9 @@ function parseSiteUpstream(input, kind) {
 }
 
 function renderSiteScan() {
+  const port = siteDraft?.panelPort;
+  $("site-scan-panel").hidden = !port;
+  $("site-scan-panel-port").textContent = port ? `TCP ${port}` : "";
   const status = $("site-scan-status");
   status.textContent = siteDraft?.scanStatus || "";
   status.hidden = !status.textContent;
@@ -680,6 +719,7 @@ async function scanSiteServices() {
   if (!draft || draft.kind !== "proxy" || draft.scan || draft.submitting || !$("site-dialog").open) return;
   const controller = draft.scan = new AbortController();
   draft.services = [];
+  draft.panelPort = null;
   draft.selected = -1;
   draft.scanStatus = "正在读取本机 TCP 监听端口…";
   renderSiteScan();
@@ -688,7 +728,8 @@ async function scanSiteServices() {
     const data = await api("sites/scan", { signal: controller.signal, cache: "no-store" });
     if (siteDraft !== draft || draft.scan !== controller || !$("site-dialog").open) return;
     draft.services = Array.isArray(data.services) ? data.services.filter((entry) => entry && typeof entry === "object") : [];
-    draft.scanStatus = draft.services.length ? `发现 ${draft.services.length} 个监听项。` : "未找到本机 TCP 监听项，可手动填写上游地址。";
+    if (Number.isInteger(data.panel_port) && data.panel_port > 0 && data.panel_port <= 65535) draft.panelPort = data.panel_port;
+    draft.scanStatus = draft.services.length ? `发现 ${draft.services.length} 个候选应用端口。` : "未找到候选应用端口，可手动填写上游地址。";
     if (data.truncated) draft.scanStatus += " 结果已截断，可手动填写未列出的服务。";
   } catch (error) {
     if (siteDraft === draft && draft.scan === controller) draft.scanStatus = `扫描失败：${error.message}`;
@@ -962,7 +1003,7 @@ function renderInfo() {
 
 function searchViews() {
   const query = $("search-input").value.trim().toLowerCase();
-  const aliases = { overview: "cpu memory dashboard 监控", files: "file upload 编辑 上传", containers: "docker logs 容器 日志", sites: "website sites wordpress caddy https 域名 反代 站点管理 环境管理 证书", terminal: "shell ssh pty 诊断 命令 远程服务器", processes: "process pid 进程", audit: "audit log 审计 记录", appearance: "theme background wallpaper 主题 外观 背景 图片", info: "setting settings 配置 信息" };
+  const aliases = { overview: "cpu memory dashboard 监控", files: "file upload 编辑 上传", containers: "docker logs 容器 日志", sites: "website sites wordpress caddy https 域名 反代 站点管理 环境管理 证书", terminal: "shell ssh pty 诊断 命令 远程服务器", processes: "process pid 进程", audit: "audit log 审计 记录", appearance: "theme background wallpaper 主题 外观 背景 图片", settings: "setting settings 端口 Nginx Passkey Google Authenticator 二步验证", info: "配置 信息" };
   const results = Object.entries(views).filter(([key, view]) => `${view.title} ${aliases[key]}`.toLowerCase().includes(query));
   $("search-results").innerHTML = results.map(([key, view]) => `<a class="search-result" href="#${key}" data-search-result>${icon(view.icon)}<div>${view.title}<small>${view.description}</small></div></a>`).join("") || empty("没有匹配的功能", "试试搜索「文件」「Docker」或「终端」。", "search");
 }
@@ -1038,11 +1079,24 @@ $("login-form").addEventListener("submit", async (event) => {
       ? { credential: $("credential").value, username: $("new-username").value, password: $("new-password").value, confirmation: $("confirm-password").value }
       : { username: $("username").value, password: $("password").value };
     if (setup && body.password !== body.confirmation) throw new Error("两次输入的密码不一致。");
-    await api(setup ? "register" : "login", { method: "POST", login: true, body });
+    const flow = await api(setup ? "register" : "login", { method: "POST", login: true, body });
     ["credential", "new-password", "confirm-password", "password"].forEach((id) => { $(id).value = ""; });
-    $("password").value = "";
     state.path = "";
-    await enterApp();
+    if (flow.challenge) {
+      $("login-form").hidden = true;
+      $("login-verification").hidden = false;
+      const title = document.createElement("h2"), stage = document.createElement("div");
+      title.textContent = "完成登录验证";
+      $("login-verification").replaceChildren(title, stage);
+      loginVerification = window.HarborSecuritySettings.verification(stage, {
+        api, endpoint: "login/mfa", flow, login: true,
+        onSuccess: async () => {
+          clearLoginVerification();
+          try { await enterApp(); } catch (failure) { showLogin(); $("login-error").textContent = failure.message; }
+        },
+        onCancel: (message = "") => { clearLoginVerification(); $("login-error").textContent = message; $("password").focus(); },
+      });
+    } else await enterApp();
   } catch (error) { showLogin(); $("login-error").textContent = error.message; }
   finally { button.disabled = false; }
 });
@@ -1188,9 +1242,9 @@ document.addEventListener("visibilitychange", () => {
     clearSiteCredentials();
   } else syncSites(page, true);
 });
-window.addEventListener("pagehide", () => { disposeTerminal(); disposeSites(); });
+window.addEventListener("pagehide", () => { disposeTerminal(); disposeSites(); disposeSettings(); clearLoginVerification(); });
 window.addEventListener("pageshow", (event) => {
-  if (event.persisted && state.session && (state.view === "terminal" || state.view === "sites")) navigate();
+  if (event.persisted && state.session && ["terminal", "sites", "settings"].includes(state.view)) navigate();
 });
 window.addEventListener("hashchange", navigate);
 renderNav();

@@ -25,6 +25,8 @@ from host import Host
 from appearance import AppearanceStore
 from terminal import TerminalManager
 from sites import SiteManager
+from host_settings import HEALTH_PATH, HostSettings
+from mfa import MFA, webauthn_user_handle
 
 
 BASE = Path(__file__).resolve().parent
@@ -61,38 +63,125 @@ class Auth:
         self.sessions = {}
         self.attempts = defaultdict(deque)
         self.lock = threading.RLock()
+        self.mfa = MFA(self.auth_path)
 
     def _hash(self, password):
         return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), self.salt, 210000)
 
-    def _create_session(self, address, username, password):
+    def _check_password(self, address, username, password, *, reauth=False):
         now = time.monotonic()
         with self.lock:
             self.attempts = defaultdict(deque, {ip: deque(t for t in times if now - t < 60) for ip, times in self.attempts.items() if times and now - times[-1] < 60})
+            if address not in self.attempts and len(self.attempts) >= 1024:
+                raise PanelError("Too many login attempts. Try again in one minute.", 429)
             attempts = self.attempts[address]
-            if len(attempts) >= 5 or len(self.attempts) > 1024:
+            if len(attempts) >= 5:
                 raise PanelError("Too many login attempts. Try again in one minute.", 429)
             attempts.append(now)
-        using_legacy = self.auth_path is None
-        expected_hash = self.legacy_password_hash if using_legacy else self.password_hash
-        password_hash = self._hash(password) if isinstance(password, str) and expected_hash is not None else None
-        valid = password_hash is not None and hmac.compare_digest(password_hash, expected_hash)
-        if self.auth_path:
-            valid = valid and isinstance(username, str) and hmac.compare_digest(username.encode("utf-8"), self.username.encode("utf-8"))
+            expected_hash = self.password_hash if self.auth_path else self.legacy_password_hash
+            salt, expected_user = self.salt, self.username
+        try:
+            password_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 210000) if isinstance(password, str) and len(password) <= 1024 and expected_hash is not None else None
+            valid = password_hash is not None and hmac.compare_digest(password_hash, expected_hash)
+            if self.auth_path and not reauth:
+                valid = valid and isinstance(username, str) and expected_user is not None and hmac.compare_digest(username.encode("utf-8"), expected_user.encode("utf-8"))
+        except UnicodeError:
+            valid = False
         if not valid:
-            raise PanelError("Invalid administrator username or password.", 401)
+            raise PanelError("Invalid administrator password." if reauth else "Invalid administrator username or password.", 403 if reauth else 401)
         with self.lock:
             self.attempts.pop(address, None)
-            self.sessions = {token: session for token, session in self.sessions.items() if session["expires"] > now}
-            if len(self.sessions) >= 32:
-                oldest = min(self.sessions, key=lambda token: self.sessions[token]["expires"])
-                del self.sessions[oldest]
-            token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-            self.sessions[token] = {"csrf": csrf, "expires": now + self.TTL}
+
+    def _issue_session(self, *, mfa=False):
+        now = time.monotonic()
+        self.sessions = {token: session for token, session in self.sessions.items() if session["expires"] > now}
+        if len(self.sessions) >= 32:
+            self.logout(min(self.sessions, key=lambda token: self.sessions[token]["expires"]))
+        token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+        self.sessions[token] = {"csrf": csrf, "expires": now + self.TTL, "mfa": mfa}
         return token, csrf
 
-    def login(self, username, password, address):
-        return self._create_session(address, username, password)
+    @staticmethod
+    def _require_mfa_https(origin):
+        if not origin:
+            raise PanelError("Second factors require the configured HTTPS panel address and trusted TLS proxy.", 403)
+
+    def _verification_start(self, purpose, owner, origin, rp_id, *, scope="mfa"):
+        self._require_mfa_https(origin)
+        methods = self.mfa.status(rp_id)["methods"]
+        if not methods:
+            raise PanelError("No enrolled second factor is usable at this HTTPS address. Contact the host administrator.", 403)
+        return {"challenge": self.mfa.begin(purpose, owner, origin, scope=scope), "methods": methods}
+
+    def login(self, username, password, address, origin=None, rp_id=None):
+        self._check_password(address, username, password)
+        with self.lock:
+            if self.mfa.enabled():
+                return self._verification_start("login", address, origin, rp_id)
+            return self._issue_session()
+
+    def mfa_login(self, action, address, origin, rp_id, body):
+        self._require_mfa_https(origin)
+        with self.lock:
+            challenge = body.get("challenge")
+            if action == "options":
+                return self.mfa.assertion_options(challenge, "login", address, origin, rp_id)
+            self.mfa.verify(challenge, "login", address, origin, rp_id, webauthn_user_handle(self.salt), body.get("method"), body)
+            return self._issue_session(mfa=True)
+
+    def mfa_status(self, token, origin, rp_id):
+        with self.lock:
+            self.session(token)
+            status = self.mfa.status(rp_id)
+            status.pop("methods")
+            return {**status, "available": bool(origin and self.username), "passkey_available": bool(origin and rp_id and self.username)}
+
+    def mfa_settings(self, action, token, address, origin, rp_id, body):
+        self._require_mfa_https(origin)
+        if action == "reauth":
+            self._check_password(address, None, body.get("password"), reauth=True)
+        with self.lock:
+            self.session(token)
+            if not self.username:
+                raise PanelError("MFA requires a registered administrator.", 403)
+            user_handle = webauthn_user_handle(self.salt)
+            if action == "reauth":
+                self.mfa.clear_owner(token)
+                scope = body.get("scope", "mfa")
+                if scope not in ("mfa", "listener"):
+                    raise PanelError("Unknown verification operation.")
+                if self.mfa.enabled():
+                    return self._verification_start("reauth", token, origin, rp_id, scope=scope), None
+                return {"grant": self.mfa.begin("grant", token, origin, scope=scope)}, None
+            if action == "reauth/options":
+                return self.mfa.assertion_options(body.get("challenge"), "reauth", token, origin, rp_id), None
+            if action == "reauth/verify":
+                scope = self.mfa.verify(body.get("challenge"), "reauth", token, origin, rp_id, user_handle, body.get("method"), body)
+                return {"grant": self.mfa.begin("grant", token, origin, scope=scope)}, None
+            if action == "enroll/start":
+                return self.mfa.start_enrollment(body.get("grant"), token, origin, rp_id, self.username, user_handle, body.get("method")), None
+            if action == "enroll/finish":
+                self.mfa.finish_enrollment(body.get("enrollment_id"), token, origin, rp_id, body)
+            elif action == "remove":
+                self.mfa.remove(body.get("grant"), token, origin, body.get("method"), body.get("id"))
+            else:
+                raise PanelError("API route not found.", 404)
+            revoked = tuple(self.sessions)
+            self.sessions.clear()
+            self.mfa.clear()
+            return {"signed_out": True}, revoked
+
+    def authorize_listener_change(self, token, address, origin, body):
+        if origin:
+            with self.lock:
+                self.session(token)
+                self.mfa.take_grant(body.get("grant"), token, origin, "listener")
+            return
+        with self.lock:
+            self.session(token)
+            if self.mfa.enabled():
+                raise PanelError("Use the configured HTTPS address to verify this change.", 403)
+            self._check_password(address, None, body.get("password"), reauth=True)
 
     def setup_required(self):
         return bool(self.auth_path and self.username is None)
@@ -124,7 +213,9 @@ class Auth:
             if self.bootstrap_token_file:
                 if self.bootstrap_token_file.exists():
                     self.bootstrap_token_file.unlink()
-        return self._create_session(address, username, password)
+            if self.mfa.enabled():
+                raise PanelError("Existing second factors must be recovered by the host administrator.", 403)
+            return self._issue_session()
 
     def session(self, token):
         with self.lock:
@@ -192,18 +283,36 @@ class PanelServer(ThreadingHTTPServer):
         self.public_bind = self.server_address[0] not in ("127.0.0.1", "::1")
         self.origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
         self.secure_cookie = False
+        self.public_origin = None
+        self.rp_id = None
         if public_origin:
-            parsed = urlsplit(public_origin)
-            if parsed.scheme != "https" or not parsed.netloc or parsed.path not in ("", "/") or parsed.query or parsed.fragment or parsed.username:
+            try:
+                parsed = urlsplit(public_origin)
+                if (parsed.scheme != "https" or not parsed.hostname or parsed.path not in ("", "/")
+                        or parsed.query or parsed.fragment or parsed.username is not None or parsed.password is not None):
+                    raise ValueError
+                hostname = parsed.hostname.encode("idna").decode("ascii")
+                origin_port = parsed.port
+                authority = f"[{hostname}]" if ":" in hostname else hostname
+                if origin_port is not None and origin_port != 443:
+                    authority += f":{origin_port}"
+                self.public_origin = f"https://{authority}"
+                try:
+                    ipaddress.ip_address(hostname)
+                except ValueError:
+                    self.rp_id = hostname
+            except (ValueError, UnicodeError):
                 self.server_close()
-                raise ValueError("--public-origin must be an HTTPS origin, e.g. https://panel.example.com")
-            self.origins = {public_origin.rstrip("/")}
+                raise ValueError("--public-origin must be an HTTPS origin, e.g. https://panel.example.com") from None
+            self.origins = {self.public_origin}
             self.secure_cookie = True
         self.allowed_hosts = {urlsplit(origin).netloc.lower() for origin in self.origins}
         try:
             self.sites = SiteManager(state, self.full_host_root, self.audit, port,
                                      {urlsplit(origin).hostname for origin in self.origins}, self.secure_cookie)
             self.host = Host(self.files.root, full_host=full_host)
+            self.host_settings = HostSettings(state, full_host=self.full_host_root, panel_port=port,
+                                              public_origin=self.public_origin, panel_host=self.server_address[0])
         except Exception:
             self.server_close()
             raise
@@ -317,6 +426,29 @@ class Handler(BaseHTTPRequestHandler):
         value = f"harbor_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={0 if expired else Auth.TTL}"
         return value + ("; Secure" if self.server.secure_cookie else "")
 
+    def _mfa_origin(self, mutation):
+        origin = self.server.public_origin
+        if not origin or self.headers.get("Host", "").lower() not in self.server.allowed_hosts:
+            return None
+        if mutation and self.headers.get_all("Origin") != [origin]:
+            return None
+        # TLS terminates at a same-host reverse proxy. It must overwrite this header.
+        if not ipaddress.ip_address(self.client_address[0]).is_loopback:
+            return None
+        return origin if self.headers.get_all("X-Forwarded-Proto") == ["https"] else None
+
+    def _respond_login(self, result, address):
+        previous_token = self._token()
+        self.server.auth.logout(previous_token)
+        self.server.terminal.close_owner(previous_token)
+        if isinstance(result, dict):
+            headers = {"Set-Cookie": self._cookie("", expired=True)} if previous_token else None
+            self._respond(202, result, headers=headers)
+            return
+        token, csrf = result
+        self.server.audit.add("login", "administrator", address)
+        self._respond(200, {"csrf": csrf}, headers={"Set-Cookie": self._cookie(token)})
+
     def do_GET(self):
         self._dispatch(False)
 
@@ -329,7 +461,11 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch(self, mutation):
         try:
             host = self.headers.get("Host", "").lower()
-            if host not in self.server.allowed_hosts:
+            parsed = urlsplit(self.path)
+            local_health = (self.command == "GET" and parsed.path == HEALTH_PATH
+                            and host == f"127.0.0.1:{self.server.server_port}"
+                            and ipaddress.ip_address(self.client_address[0]).is_loopback)
+            if not local_health and host not in self.server.allowed_hosts:
                 try:
                     ipaddress.ip_address(urlsplit(f"//{host}").hostname or "")
                 except ValueError:
@@ -347,26 +483,35 @@ class Handler(BaseHTTPRequestHandler):
                 raise PanelError("Origin is not allowed.", 403)
             if mutation and origin not in self.server.origins and not (self.server.public_bind and not self.server.secure_cookie and origin == public_origin):
                 raise PanelError("An allowed Origin header is required.", 403)
-            parsed = urlsplit(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
             relative = query.get("path", [""])[0]
             address = self.client_address[0]
+            if path == HEALTH_PATH and self.command == "GET":
+                nonce = query.get("nonce", [])
+                allowed_probe = local_health or (self._mfa_origin(False) if self.server.public_origin else False)
+                proof = self.server.host_settings.health(nonce[0]) if allowed_probe and len(nonce) == 1 else None
+                self._respond(200 if proof else 404, proof or {"error": "Not found."})
+                return
             if path == "/api/setup" and self.command == "GET":
                 self._respond(200, {"required": self.server.auth.setup_required(), "full_host": self.server.full_host, "full_host_root": self.server.full_host_root, "public_http": self.server.public_bind and not self.server.secure_cookie})
                 return
-            if path == "/api/login" and self.command == "POST":
+            mfa_origin = self._mfa_origin(mutation)
+            if self.command == "POST" and path in ("/api/login", "/api/login/mfa/options", "/api/login/mfa/verify"):
                 body = self._body()
                 try:
-                    token, csrf = self.server.auth.login(body.get("username"), body.get("password"), address)
+                    if path == "/api/login":
+                        result = self.server.auth.login(body.get("username"), body.get("password"), address, mfa_origin, self.server.rp_id)
+                    else:
+                        result = self.server.auth.mfa_login(path.rsplit("/", 1)[1], address, mfa_origin, self.server.rp_id, body)
                 except PanelError:
-                    self.server.audit.add("login", "administrator", address, False)
+                    if not path.endswith("/options"):
+                        self.server.audit.add("login", "administrator", address, False)
                     raise
-                previous_token = self._token()
-                self.server.auth.logout(previous_token)
-                self.server.terminal.close_owner(previous_token)
-                self.server.audit.add("login", "administrator", address)
-                self._respond(200, {"csrf": csrf}, headers={"Set-Cookie": self._cookie(token)})
+                if path.endswith("/options"):
+                    self._respond(200, result)
+                else:
+                    self._respond_login(result, address)
                 return
             if path == "/api/register" and self.command == "POST":
                 body = self._body()
@@ -381,8 +526,16 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/"):
                 token = self._token()
                 session = self.server.auth.session(token)
+                if session["mfa"]:
+                    self.server.auth._require_mfa_https(mfa_origin)
                 if mutation and not hmac.compare_digest(self.headers.get("X-CSRF-Token", "").encode("utf-8"), session["csrf"].encode("ascii")):
                     raise PanelError("CSRF token is missing or invalid.", 403)
+                if path == "/api/mfa" and self.command == "GET":
+                    self._respond(200, self.server.auth.mfa_status(token, mfa_origin, self.server.rp_id))
+                    return
+                if path.startswith("/api/mfa/") and self.command == "POST":
+                    self._write_mfa(path.removeprefix("/api/mfa/"), token, address, mfa_origin)
+                    return
                 if path == "/api/terminal/ws" and self.command == "GET":
                     self.server.terminal.serve(self, token, session, self.server.secure_cookie)
                     return
@@ -393,7 +546,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if mutation:
                 raise PanelError("Route not found.", 404)
-            assets = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/style.css": "style.css", "/favicon.svg": "favicon.svg", "/vendor/xterm.js": "vendor/xterm.js", "/vendor/xterm.css": "vendor/xterm.css", "/vendor/xterm-addon-fit.js": "vendor/xterm-addon-fit.js"}
+            assets = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/security-settings.js": "security-settings.js", "/host-settings.js": "host-settings.js", "/style.css": "style.css", "/favicon.svg": "favicon.svg", "/vendor/xterm.js": "vendor/xterm.js", "/vendor/xterm.css": "vendor/xterm.css", "/vendor/xterm-addon-fit.js": "vendor/xterm-addon-fit.js"}
             if path not in assets:
                 raise PanelError("Page not found.", 404)
             asset = BASE / "web" / assets[path]
@@ -419,9 +572,30 @@ class Handler(BaseHTTPRequestHandler):
             LOG.exception("Unexpected request failure")
             self._respond(500, {"error": "Unexpected server error. Check the server log for details."})
 
+    def _write_mfa(self, action, token, address, origin):
+        if action not in {"reauth", "reauth/options", "reauth/verify", "enroll/start", "enroll/finish", "remove"}:
+            raise PanelError("API route not found.", 404)
+        body = self._body()
+        audit_action = "mfa." + action.replace("/", ".")
+        try:
+            result, revoked = self.server.auth.mfa_settings(action, token, address, origin, self.server.rp_id, body)
+        except PanelError:
+            self.server.audit.add(audit_action, "administrator", address, False)
+            raise
+        if revoked is not None:
+            for old_token in revoked:
+                self.server.terminal.close_owner(old_token)
+        self.server.audit.add(audit_action, "administrator", address)
+        headers = {"Set-Cookie": self._cookie("", expired=True)} if revoked is not None else None
+        self._respond(200, result, headers=headers)
+
     def _get_api(self, path, relative, query, session):
         if path == "/api/session":
             result = {"csrf": session["csrf"], "version": "0.1.0", "file_root": str(self.server.files.root), "platform": os.name, "commands": list(Host.COMMANDS), "full_host": self.server.full_host, "full_host_root": self.server.full_host_root, "public_http": self.server.public_bind and not self.server.secure_cookie, "https_remote_ssh": self.server.secure_cookie}
+        elif path == "/api/host-settings":
+            result = self.server.host_settings.status()
+        elif path == "/api/host-settings/job":
+            result = self.server.host_settings.job(query.get("id", [""])[0])
         elif path == "/api/sites":
             result = self.server.sites.overview()
         elif path == "/api/sites/environment":
@@ -461,6 +635,26 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(200, result)
 
     def _write_api(self, path, address, token):
+        if self.command == "POST" and path in ("/api/host-settings/change", "/api/host-settings/ssh/confirm"):
+            body = self._body()
+            operation = "listener.confirm" if path.endswith("/confirm") else "listener.change"
+            target = "system SSH" if path.endswith("/confirm") or body.get("kind") == "ssh" else "Harbor Panel"
+            origin = self._mfa_origin(True)
+            try:
+                if self.server.public_origin and not origin:
+                    raise PanelError("Use the configured HTTPS address to verify this change.", 403)
+                self.server.auth.authorize_listener_change(token, address, origin, body)
+                self.server.audit.add(operation + ".requested", target, address)
+                if path.endswith("/confirm"):
+                    result = self.server.host_settings.confirm_ssh(body.get("id"))
+                else:
+                    result = self.server.host_settings.start(body.get("kind"), body.get("port"),
+                                                             firewall_ready=body.get("firewall_ready"))
+            except PanelError:
+                self.server.audit.add(operation, target, address, False)
+                raise
+            self._respond(202, result)
+            return
         routes = {("POST", "/api/logout"), ("POST", "/api/terminal"), ("POST", "/api/containers/action"), ("PUT", "/api/containers/config"), ("PUT", "/api/files/write"), ("POST", "/api/files/mkdir"), ("POST", "/api/appearance"), ("PUT", "/api/appearance/background"), ("POST", "/api/appearance/background/remove")}
         if self.command == "POST" and path in ("/api/sites", "/api/sites/action", "/api/sites/environment"):
             body = self._body()
@@ -542,11 +736,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="Harbor Panel - independent single-host operations workspace")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default=os.environ.get("HARBOR_PANEL_BIND", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=8088)
     parser.add_argument("--root", type=Path, default=BASE / "workspace")
     parser.add_argument("--state-dir", type=Path, default=BASE / ".state")
-    parser.add_argument("--public-origin", help="HTTPS origin when deployed behind a trusted reverse proxy")
+    parser.add_argument("--public-origin", default=os.environ.get("HARBOR_PANEL_PUBLIC_ORIGIN"),
+                        help="HTTPS origin when deployed behind a trusted reverse proxy")
     parser.add_argument("--bootstrap-token-file", type=Path, help="One-time administrator registration credential file")
     parser.add_argument("--full-host", action="store_true", help="Grant file and terminal APIs full host access; use only for trusted administrators")
     args = parser.parse_args()

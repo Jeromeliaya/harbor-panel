@@ -115,7 +115,7 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;bac
 .site-scan-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
 .site-scan-heading>div{flex:1 1 220px}
 .site-scan h3{margin:0 0 4px;font-size:12px}
-#site-scan-status{margin-top:10px}
+#site-scan-panel,#site-scan-status{margin-top:10px}
 .site-scan-results{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:210px;overflow:auto;list-style:none;margin:10px 0 0;padding:4px}
 .site-scan-option{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 8px;align-items:center;text-align:left;padding:8px;width:100%;border:1px solid var(--line);border-radius:8px;background:var(--paper);font-size:12px;overflow-wrap:anywhere}
 .site-scan-option:hover:enabled{border-color:var(--green)}
@@ -127,3 +127,13 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;bac
 .site-credentials dd{margin:0;overflow-wrap:anywhere;white-space:pre-wrap;user-select:text}
 @media(max-width:700px){.site-env-grid,.site-kind-grid,.site-scan-results{grid-template-columns:minmax(0,1fr)}.site-form-body{padding:16px}.site-dialog .dialog-footer{align-items:center}}
 @media(max-width:480px){.page-heading:has(#sites-create:not([hidden])){flex-wrap:wrap}.page-heading:has(#sites-create:not([hidden])) .page-heading-actions{margin-left:auto}}
+
+.settings-stack,.settings-grid,.settings-card,.settings-feedback,.settings-card .stack,.settings-verification .stack,#login-verification .stack{display:grid;gap:14px}
+.settings-grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr))}
+.settings-card,.settings-verification:not(:empty),.settings-feedback:not(:empty){padding:20px;overflow-wrap:anywhere}
+.settings-card h2,.settings-card p,.settings-feedback p,.settings-verification h3{margin:0}
+.settings-card button,.settings-verification button,.settings-stack>button{justify-self:start}
+.settings-card label,.settings-verification label{display:grid;gap:6px}
+.settings-card .settings-check{display:flex;gap:8px;align-items:center}
+.settings-feedback:not(:empty),.settings-verification:not(:empty){border:1px solid var(--line);border-radius:12px}
+.settings-feedback a{color:var(--ink);text-decoration:underline}

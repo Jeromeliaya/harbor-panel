@@ -58,13 +58,35 @@ class SiteTests(unittest.TestCase):
         with mock.patch.object(self.manager, "_listening", return_value=listeners), \
                 mock.patch.object(self.manager, "_project", return_value="webserver"), \
                 mock.patch.object(self.manager, "_containers", return_value=[docker]):
-            self.assertEqual(self.manager.scan()["services"], [
+            scan = self.manager.scan()
+            self.assertEqual(scan["panel_port"], 8088)
+            self.assertEqual(scan["services"], [
                 {"port": 3000, "address": "127.0.0.1", "project": "shop/web", "upstream": "127.0.0.1:3000"},
                 {"port": 8000, "address": "::1", "project": "webserver", "upstream": "[::1]:8000"},
             ])
             self.assertEqual(self.manager._target(parse_upstream("web:80", "proxy")).address, "127.0.0.1:3000")
             with self.assertRaises(PanelError):
                 self.manager._target(parse_upstream("web:81", "proxy"))
+
+    def test_scan_filters_system_listeners_and_non_web_docker_bindings(self):
+        listeners = [SimpleNamespace(laddr=SimpleNamespace(ip=host, port=port), pid=pid)
+                     for host, port, pid in [("127.0.0.1", 25, 10), ("::1", 25, 10), ("0.0.0.0", 2222, 11),
+                                             ("::", 55123, 12), ("127.0.0.53", 53, 13), ("::1", 5355, 13),
+                                             ("127.0.0.1", 55124, 13), ("127.0.0.1", 55125, 1),
+                                             ("127.0.0.1", 55126, None), ("127.0.0.1", 55127, 14),
+                                             ("0.0.0.0", 8022, 15)]]
+        names = {10: "application", 11: "sshd", 12: "sshd-session", 13: "systemd-resolved", 14: None, 15: "docker-proxy"}
+        container = {"name": "/mixed", "service": "", "project": "", "owner": "", "ports": {
+            "22/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8022"}],
+            "25/tcp": [{"HostIp": "127.0.0.1", "HostPort": "2525"}],
+            "80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "25"}, {"HostIp": "127.0.0.1", "HostPort": "3000"}],
+        }}
+        with mock.patch.object(self.manager, "_listening", return_value=listeners), \
+                mock.patch.object(self.manager, "_project", side_effect=names.__getitem__), \
+                mock.patch.object(self.manager, "_containers", return_value=[container]):
+            self.assertEqual(self.manager.scan()["services"], [
+                {"port": 3000, "address": "127.0.0.1", "project": "mixed", "upstream": "127.0.0.1:3000"},
+            ])
 
     def test_docker_binding_conflicts_even_without_listening_process(self):
         docker = {"name": "/existing-web", "ports": {"8443/tcp": [{"HostIp": "0.0.0.0", "HostPort": "443"}]}}

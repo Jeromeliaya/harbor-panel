@@ -19,7 +19,8 @@
 | 外观主题 | 苔影花园、等高线、月下档案、陶土织纹四套图案主题；支持本机上传背景、切换和移除，重启后保留 |
 | 进程监控 | 真实 PID、进程名称、所属用户、状态、RSS；按内存降序显示前 150 个可访问进程 |
 | 网站 | 原生 Linux 支持一键 WordPress、IP/端口与 HTTPS 域名反代、本机 TCP 监听列表、环境管理及 Let’s Encrypt 自动 HTTPS |
-| 操作审计 | 登录、退出、文件变更、SSH 连接/断开、外观、容器及网站操作；不记录 SSH 密码与终端内容，SQLite 保留最近 10,000 条 |
+| 设置 | HTTPS 下支持 Passkey 和 Google Authenticator；原生 root systemd 部署可管理系统 SSH 端口及面板端口，并联动已配置的 Nginx 反代 |
+| 操作审计 | 登录、退出、文件变更、SSH 连接/断开、外观、容器、网站及设置请求；不记录 SSH 密码、终端内容或两步验证凭证，SQLite 保留最近 10,000 条 |
 | 入口保护 | 密码散列验证、登录限速、服务端会话、HttpOnly/SameSite Cookie、Origin/Host 校验、CSRF、CSP |
 
 界面支持中文、窄屏导航、功能搜索（Ctrl/Cmd K）、编辑器保存快捷键（Ctrl/Cmd S）。所有图表来自实际采样；Docker 不可用时明确显示错误，不填充演示数据。
@@ -128,14 +129,18 @@ docker compose down
 | Alpine Linux | `apk` | OpenRC |
 | CentOS / Rocky / AlmaLinux / RHEL / Fedora | `dnf` 或 `yum` | 通常为 systemd |
 
-也可以直接通过 `curl` 打开交互式管理菜单。菜单提供安装、更新、卸载和退出；源码从本仓库下载，更新不会删除工作区、审计数据库或密码配置：
+也可以直接通过 `curl` 打开交互式管理菜单。菜单提供安装、更新、卸载、快捷命令设置和退出；源码从本仓库下载，更新不会删除工作区、审计数据库或密码配置：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Jeromeliaya/harbor-panel/main/deploy/menu.sh -o /tmp/harbor-panel-menu.sh
-sudo sh /tmp/harbor-panel-menu.sh
+sudo curl -fsSL https://raw.githubusercontent.com/Jeromeliaya/harbor-panel/main/deploy/menu.sh -o /root/harbor-panel-menu.sh
+sudo sh /root/harbor-panel-menu.sh
 ```
 
-菜单选项：`1` 安装、`2` 更新、`3` 卸载、`0` 退出。选择安装时会提示输入服务端口，允许 `0-65535`，直接回车使用默认端口 `8088`；端口配置保存于 `/etc/harbor-panel.port`，后续更新会自动沿用。自定义程序和状态目录保存于 `/etc/harbor-panel.paths`，后续菜单操作会继续使用。端口 `0` 由操作系统临时分配，适合测试，不适合作为固定访问地址。卸载需要输入 `UNINSTALL` 确认，清除管理员账户和注册凭证以使其失效，保留 `/srv/harbor-workspace`、审计数据及 `/etc/harbor-panel.env`；重新安装会生成新的注册凭证。更新不会重置账户或凭证。如服务器没有 `curl`，可使用 `wget` 替代下载菜单脚本。
+菜单选项：`1` 安装、`2` 更新、`3` 卸载、`5` 设置面板快捷、`0` 退出。安装默认端口 `8088`，可输入 `0–65535`（`0` 为临时端口，不用于固定部署）。更新沿用 `/etc/harbor-panel.port` 和 `/etc/harbor-panel.paths`，保留账户和数据。快捷命令支持中英文、数字及 `_ . + -`；不能包含空格或 Shell 操作符，也不能覆盖已有命令。示例：设置 `港口` 后输入 `港口` 即可重新打开菜单。
+
+卸载先询问是否备份，再要求输入 `UNINSTALL`。它删除验证归属的专用程序及状态目录（包括其中的工作区、审计、账户、MFA 和凭证）、面板环境配置和服务文件、快捷命令，以及可验证的原版下载脚本（按上例命名为 `harbor-panel-menu.sh`，未被替换或移走）。也会停止并清除面板管理的 WordPress 与专用 Caddy 容器、数据卷及专用网络；手工安装的应用、外部反代目标、未验证归属的旧 `/srv/harbor-workspace` 不会被删。Nginx 和系统 SSH 仍引用的管理员配置不会自动拆除；如需移除，先调整对应服务的 `include` 并验证配置和连通性。
+
+备份保存到 `/root/harbor-panel-backups/`，包含目录、配置、已识别 Docker 数据和恢复说明，含敏感信息，请只允许 root 访问；备份失败会阻止删除。重新安装须重新下载菜单并使用新的一次性凭证。仅当手动恢复旧认证数据库时旧账户和验证方式才会回来；如要重新注册，不要恢复 `auth.sqlite3`、其 WAL/SHM 或旧 `bootstrap.token`。
 
 源码默认放在 `/opt/harbor-panel` 时，在项目目录执行：
 
@@ -159,12 +164,22 @@ sudo HARBOR_PANEL_DIR=/srv/harbor-panel sh deploy/install.sh
 4. 将对应的 systemd 或 OpenRC 服务模板复制到系统服务目录，确认文件路径和账户正确，再启用服务。
 5. 菜单安装会自动尝试显示 VPS 公网 IP，访问 `http://<VPS公网IP>:<所选端口>` 并完成首次注册；若 IP 无法自动探测，请从 VPS 服务商控制台获取。确认云安全组及系统防火墙允许该 TCP 端口入站。手动部署使用公网访问时，在启动命令加入 `--host 0.0.0.0`；若只希望通过 SSH 隧道访问，则继续使用 `ssh -L 8088:127.0.0.1:8088 user@your-server`，然后访问本机 `http://127.0.0.1:8088`。
 
-如需使用域名，可选配置 Nginx 与 HTTPS，并在 service 的 `ExecStart` 末尾添加 `--public-origin https://panel.example.com`。外部 Origin 必须精确匹配 HTTPS 协议、主机及非默认端口；该模式设置 Secure Cookie，浏览器登录必须通过指定 HTTPS 域名。配置该模式后，原有公网 IP:端口 HTTP 登录会被拒绝；不配置 `--public-origin` 时则可继续通过公网 IP 和端口访问，但必须接受未加密 HTTP 风险。反向代理要保留 Host，例如 TLS Nginx server 内配置：
+### Nginx HTTPS 与面板设置
+
+原生 systemd 部署可将下面两行写入 root 专用的 `/etc/harbor-panel.env`（权限 `0600`），再重启 `harbor-panel`。不要直接修改服务模板；如果旧版本在服务文件中手动设置了 `--host` 或 `--public-origin`，请先备份旧配置、迁移这两项并恢复与原安装版本一致的服务模板，再进行更新。其他手动或容器部署仍可使用 `--public-origin` 参数。启用公网 Origin 后只能通过指定的 HTTPS 域名登录，不能再用公网 IP 的 HTTP 地址登录。
+
+```ini
+HARBOR_PANEL_BIND=127.0.0.1
+HARBOR_PANEL_PUBLIC_ORIGIN=https://panel.example.com
+```
+
+在 Nginx 的 HTTPS 面板站点中配置下方 `location`。如果要从面板自动更新反代端口，创建归 root 所有且不可被其他用户写入的 `/etc/harbor-panel.nginx-upstream`，内容仅为 `proxy_pass http://127.0.0.1:8088;`（替换为当前端口），并仅在面板的 HTTPS `location` 中引用一次。先运行 `nginx -t` 再重载 Nginx，确认现有域名可以登录。只想用 HTTPS、不需要自动改端口时，可用固定 `proxy_pass` 代替 `include`。
 
 ```nginx
 location / {
-    proxy_pass http://127.0.0.1:8088;
+    include /etc/harbor-panel.nginx-upstream;
     proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
@@ -174,7 +189,12 @@ location / {
 }
 ```
 
-示例后端端口为 `8088`。建议同时用 VPS 防火墙限制该端口，只允许可信来源或本机代理。后端不信任 `X-Forwarded-For`，代理部署下审计来源及登录限速按代理地址统计。这里使用 Python 标准库 HTTP 服务，面向单管理员低并发场景，不建议作为直接暴露公网的大规模控制面。
+Nginx 必须和面板部署在同一 VPS，并覆盖而非透传 `X-Forwarded-Proto`。面板不信任 `X-Forwarded-For`；代理环境下审计和登录限速按代理地址统计。
+
+- **登录安全**：在「设置」中添加 Passkey 或 Google Authenticator 两步验证。启用后必须先输入管理员密码，两种方式都启用时任选一种作为第二步。新增或移除验证方式会退出全部会话。Passkey 绑定 HTTPS 域名，修改域名前应保留可用的 Google Authenticator 或其他恢复途径。没有网页跳过验证的入口；建议保留第二种验证方式和 VPS 控制台访问能力。
+- **面板端口**：原生 root systemd 支持改端口。Nginx 已按上述方式接入时，面板会验证新监听和 HTTPS 代理，失败时尝试回滚；域名地址不变，服务重启后需重新登录。仅使用 HTTP 时需事先开放新端口，修改后通过新端口登录，不会自动修改防火墙。启用前请保留 VPS 控制台访问。
+- **系统 SSH 端口**：只管理支持重载的系统 OpenSSH，不影响面板内置终端。需要 root 专用的 `/etc/ssh/harbor-panel-ports.conf`（只包含当前 `Port`，例如 `Port 22`），并在 `sshd_config` 的全局部分、所有 `Match` 之前加入 `Include /etc/ssh/harbor-panel-ports.conf`，避免重复或冲突的 `Port` 配置。先验证 `sshd -t`。不要关闭原 SSH 会话；放行新端口后另开 SSH 连接，核对主机指纹并成功登录，再在 5 分钟内确认。未确认会尝试回滚。systemd socket activation、OpenRC 与默认 Compose 不支持网页改系统 SSH 端口。
+- **恢复中断的切换**：如界面报告回滚失败或重启主机后仍有未完成任务，从 VPS 控制台检查状态目录中的 `host-settings.jobs.json`。可用安装目录中的 `.venv/bin/python host_settings.py --recover --worker <状态目录> <任务ID>` 仅尝试回滚该任务。不确定时先备份相关配置，不要强制覆盖现有文件。
 
 ### Docker 管理
 
@@ -186,10 +206,10 @@ location / {
 2. 将主域名的 DNS A 记录指向 VPS 的公网 IPv4；有 AAAA 记录时，IPv6 也必须指向同一台 VPS。开放公网 TCP 80/443，允许出站访问 Docker Hub 和 Let’s Encrypt。面板不会接管已占用 80/443 的 Web 服务，包括已有的面板 HTTPS 代理；请先规划端口，否则不能创建站点。默认 Compose 和 Windows 不启用宿主机网站管理。
 3. 打开「站点管理」右上角的「新建网站」，选 WordPress、IP/端口反代或域名反代，再点「一键创建」。专用 Caddy 异步申请并续签证书；创建成功表示路由已加载，不代表证书已签发。若等待后仍无法 HTTPS 访问，请检查 DNS、防火墙及 `docker logs harbor-panel-caddy`。
 
-- **IP/端口反代**：支持本机、内网、公网 IP 和域名加端口，例如 `127.0.0.1:3000`、`192.168.1.10:8080`。点击「扫描本机服务」只读取宿主机 TCP 监听和 Docker 已发布端口，不发探测请求；显示进程或容器/Compose 项目名，不保证每个端口都提供 HTTP。点选卡片可自动填入。Docker 名称示例 `app:80` 要求唯一匹配且目标容器端口已发布，建议绑定固定的回环端口。
+- **IP/端口反代**：支持本机、内网、公网 IP 和域名加端口，例如 `127.0.0.1:3000`、`192.168.1.10:8080`。点击「扫描本机服务」会读取宿主机 TCP 监听和 Docker 已发布端口，跳过 SSH、TCP 25、常见系统服务及无法识别归属的监听。面板自身的监听端口单独显示，只供查看，不能作为上游。扫描不发探测请求，不保证每个结果都提供 HTTP；可点选应用卡片或手动填写上游。Docker 名称示例 `app:80` 要求唯一匹配且目标容器端口已发布，建议绑定固定的回环端口。
 - **域名反代**：例如 `https://origin.example.com`，保留上游 HTTP Host 和 TLS 校验，不接受路径、查询参数或凭证。域名创建/启用时解析并固定到当时的 IP；上游地址有变化时可停用再启用站点以重新解析。不要将宿主机管理接口或不应公开的内网服务作为上游。
 - **WordPress**：先初始化随机管理员，再开放站点；MariaDB 不发布端口。HTTPS 面板会短暂显示凭证；也可以从可信 SSH 读取状态目录下 `websites/wordpress/<站点 ID>/admin-login`。默认状态目录为 `/var/lib/harbor-panel`。在网站 HTTPS 可用后登录并修改初始密码。不要把凭证放进截图或日志。
-- 停用只移除公开入口。移除 WordPress 站点会尝试清理专用容器和网络，保留文件及数据库卷，便于备份或手动恢复。更新或卸载面板不会删除网站状态、专用 Caddy 或站点容器；卸载面板不会让网站下线。若要关站，请先停用网站；若要永久清除，请先备份，再手动处理确认归属的容器、数据卷和状态文件。
+- 停用只移除公开入口。移除 WordPress 站点会尝试清理专用容器和网络，保留文件及数据库卷，便于备份或手动恢复。更新面板不会删除网站。完整卸载会让面板管理的站点下线，并删除确认归属的专用 Caddy 与 WordPress 资源（可选先备份）；不会删除用户自行安装的上游服务。
 
 ### SSH 终端与外观
 

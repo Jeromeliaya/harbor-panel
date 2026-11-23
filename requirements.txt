@@ -2,3 +2,6 @@ psutil>=5.9.8,<8
 paramiko>=3.4,<5
 wsproto>=1.2,<2
 Pillow>=10,<12
+webauthn==2.7.0
+pyotp==2.9.0
+qrcode==8.2

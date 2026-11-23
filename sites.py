@@ -35,6 +35,14 @@ DNS_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 CONTAINER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}\Z")
 SITE_ID = re.compile(r"[0-9a-f]{16}\Z")
 SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+CONTROL_PORTS = {2019, 2375, 2376, 6443, 10250}
+NON_WEB_PORTS = {22, 25, 53, 111, 139, 445, 465, 587, 631, 2049, 5353, 5355}
+SYSTEM_LISTENERS = {
+    "avahi-daemon", "containerd", "cron", "crond", "cupsd", "dnsmasq", "docker-proxy",
+    "dockerd", "dropbear", "exim", "exim4", "init", "master", "nscd", "ntpd", "rpcbind",
+    "rpc.mountd", "rpc.statd", "rsyslogd", "sendmail", "sshd", "systemd",
+}
+SYSTEM_LISTENER_PREFIXES = ("systemd-", "sshd-", "dbus-")
 
 
 def domain_name(value):
@@ -281,10 +289,10 @@ class SiteManager:
                 return psutil.Process(pid).name()
             except psutil.Error:
                 pass
-        return "未知进程"
+        return None
 
     def _entry_ports(self, pid=0):
-        return [{"port": row.laddr.port, "address": row.laddr.ip, "project": self._project(row.pid)}
+        return [{"port": row.laddr.port, "address": row.laddr.ip, "project": self._project(row.pid) or "未知进程"}
                 for row in self._listening() if row.laddr.port in (80, 443) and (not pid or row.pid != pid)]
 
     def environment(self):
@@ -351,27 +359,35 @@ class SiteManager:
 
     def scan(self):
         self._require_supported()
+        non_web = NON_WEB_PORTS | CONTROL_PORTS
+        excluded = non_web | {80, 443, self.panel_port}
         rows = {}
         for item in self._listening():
             host, port = item.laddr.ip, item.laddr.port
-            if port in (80, 443, self.panel_port) or "%" in host:
+            if port in excluded or "%" in host or item.pid in (None, 0, 1):
+                continue
+            project = self._project(item.pid)
+            if not project:
+                continue
+            name = re.split(r"[:\s]", project.lower(), maxsplit=1)[0]
+            if name in SYSTEM_LISTENERS or name.startswith(SYSTEM_LISTENER_PREFIXES):
                 continue
             if host == "0.0.0.0":
                 host = "127.0.0.1"
             elif host == "::":
                 host = "::1"
-            rows.setdefault((host, port), self._project(item.pid))
+            rows.setdefault((host, port), project)
         for container in self._containers():
             project = "/".join(filter(None, (container["project"], container["service"]))) or container["name"].lstrip("/")
-            for _, host, port in self._bindings(container):
-                if container["owner"]:
+            for inner, host, port in self._bindings(container):
+                if container["owner"] or inner in non_web:
                     rows.pop((host, port), None)
-                elif port not in (80, 443, self.panel_port) and "%" not in host:
+                elif port not in excluded and "%" not in host:
                     rows[host, port] = project
         ordered = sorted(rows.items(), key=lambda item: (item[0][1], item[0][0]))
         return {"services": [{"port": port, "address": host, "project": project, "upstream": authority(host, port)}
                              for (host, port), project in ordered[:self.MAX_SCAN]],
-                "truncated": len(ordered) > self.MAX_SCAN}
+                "panel_port": self.panel_port, "truncated": len(ordered) > self.MAX_SCAN}
 
     def set_environment(self, service, action, address):
         if service not in ("docker", "caddy") or action not in ("install", "start", "restart"):
@@ -503,7 +519,7 @@ class SiteManager:
                 target = Upstream(upstream.scheme, *ports[0])
         local = {address.address.split("%")[0] for addresses in psutil.net_if_addrs().values()
                  for address in addresses if address.family in (socket.AF_INET, socket.AF_INET6)}
-        if target.port in (self.panel_port, 2375, 2376, 6443, 10250, 2019):
+        if target.port == self.panel_port or target.port in CONTROL_PORTS:
             raise PanelError("该上游端口保留给面板或基础设施控制接口。")
         if target.port in (80, 443) and upstream.host in {site["domain"] for site in self.sites}:
             raise PanelError("不能将已有的面板站点入口用作上游。")

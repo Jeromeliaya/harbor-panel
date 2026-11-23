@@ -9,6 +9,9 @@ ARCHIVE_URL="$REPOSITORY/archive/refs/heads/$BRANCH.tar.gz"
 TMP_DIR=
 PORT_FILE=/etc/harbor-panel.port
 SERVICE_WAS_RUNNING=0
+CALLER_PATH=${PATH:-}
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 
 if [ -L /etc/harbor-panel.paths ] || [ -L "$PORT_FILE" ]; then
     echo "Service path and port configuration files must not be symbolic links." >&2
@@ -24,7 +27,6 @@ if [ -r /etc/harbor-panel.paths ]; then
 fi
 APP_DIR=${APP_DIR:-/opt/harbor-panel}
 STATE_DIR=${STATE_DIR:-/var/lib/harbor-panel}
-TOKEN_FILE="$STATE_DIR/bootstrap.token"
 
 case "$APP_DIR" in
     /*) ;;
@@ -70,6 +72,14 @@ case "$STATE_DIR" in
         exit 1
         ;;
 esac
+for directory in "$APP_DIR" "$STATE_DIR"; do
+    case "$directory" in
+        /etc/*|/usr/*|/bin/*|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/proc/*|/sys/*|/dev/*|/run/*|/boot|/boot/*|/var/lib|/var/log|/var/cache|/var/lib/docker|/var/lib/docker/*|/var/lib/containerd|/var/lib/containerd/*|/root/harbor-panel-backups|/root/harbor-panel-backups/*)
+            echo "安装路径必须是面板专用目录: $directory" >&2
+            exit 1
+            ;;
+    esac
+done
 case "$APP_DIR/" in
     "$STATE_DIR/"*) echo "Application and state paths must not overlap." >&2; exit 1 ;;
 esac
@@ -128,7 +138,7 @@ safe_root_parent() {
 }
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "请使用 root 运行。直接下载运行时可执行: curl -fsSL URL -o /tmp/harbor-panel-menu.sh && sudo sh /tmp/harbor-panel-menu.sh" >&2
+    echo "请使用 root 运行。直接下载运行时可执行: sudo curl -fsSL URL -o /root/harbor-panel-menu.sh && sudo sh /root/harbor-panel-menu.sh" >&2
     exit 1
 fi
 if has_symlink_component "$APP_DIR" || has_symlink_component "$STATE_DIR"; then
@@ -139,6 +149,35 @@ if ! safe_root_parent "$APP_DIR" || ! safe_root_parent "$STATE_DIR"; then
     echo "Parent directories of the application and state paths must be root-owned and not writable by group/other." >&2
     exit 1
 fi
+
+helper_safe() {
+    set -- $1
+    [ "$1" = 0 ] && [ "$3" = 1 ] || return 1
+    permissions=${2#${2%???}}
+    group=${permissions#?}
+    group=${group%?}
+    other=${permissions#??}
+    case "$group:$other" in
+        *[2367]*:*|*:*[2367]*) return 1 ;;
+    esac
+}
+
+menu_admin() {
+    helper="$APP_DIR/deploy/menu_admin.py"
+    if [ ! -f "$helper" ]; then
+        echo "此功能需要新版菜单组件。请先选择 2 更新，再运行安装后的菜单。" >&2
+        return 1
+    fi
+    if has_symlink_component "$helper" || ! safe_root_parent "$helper"; then
+        echo "拒绝运行未受保护的菜单组件。" >&2
+        return 1
+    fi
+    metadata=$(stat -c '%u %a %h' "$helper") || return 1
+    operation=$1
+    shift
+    helper_safe "$metadata" || return 1
+    python3 -I "$helper" "$operation" "$APP_DIR" "$STATE_DIR" "$@"
+}
 
 download() {
     if command -v curl >/dev/null 2>&1; then
@@ -302,11 +341,22 @@ install_panel() {
         echo "应用目录非空但不是 Harbor Panel；请先检查目录内容，避免覆盖用户文件。" >&2
         return 1
     fi
+    if [ -e "$STATE_DIR" ] && { [ ! -d "$STATE_DIR" ] || [ -n "$(find "$STATE_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; }; then
+        echo "状态目录非空或不是普通目录；请选择新的面板专用状态目录。" >&2
+        return 1
+    fi
+    for directory in "$APP_DIR" "$STATE_DIR"; do
+        if [ -d "$directory" ] && ! safe_root_parent "$directory/.harbor-panel-install-v1"; then
+            echo "拒绝安装到未受保护的目录: $directory" >&2
+            return 1
+        fi
+    done
     selected_port=$(read_port)
     fetch_source
     HARBOR_PANEL_DIR="$APP_DIR" HARBOR_PANEL_STATE="$STATE_DIR" sh "$APP_DIR/deploy/install.sh"
     bootstrap_token=$(PYTHONPATH="$APP_DIR" "$APP_DIR/.venv/bin/python" -c 'from server import PanelServer; import sys; path=PanelServer.prepare_bootstrap_token(sys.argv[1]); print(path.read_text(encoding="ascii") if path else "")' "$STATE_DIR")
     configure_port "$selected_port"
+    menu_admin claim "$0"
     if command -v systemctl >/dev/null 2>&1; then
         install -m 644 "$APP_DIR/deploy/harbor-panel.service" /etc/systemd/system/harbor-panel.service
         systemctl daemon-reload
@@ -332,14 +382,28 @@ update_panel() {
         echo "尚未安装 Harbor Panel，请先选择 1。"
         return
     fi
+    if [ "$(cat /etc/harbor-panel.paths 2>/dev/null)" != "$(printf 'HARBOR_PANEL_DIR=%s\nHARBOR_PANEL_STATE=%s\n' "$APP_DIR" "$STATE_DIR")" ]; then
+        echo "更新必须使用已安装服务记录的路径。" >&2
+        return 1
+    fi
     if command -v systemctl >/dev/null 2>&1; then
+        if [ -f /etc/systemd/system/harbor-panel.service ] && ! cmp -s /etc/systemd/system/harbor-panel.service "$APP_DIR/deploy/harbor-panel.service"; then
+            echo "检测到手动修改的 Harbor Panel 服务文件，更新已停止，未覆盖配置。请先备份并迁移自定义设置。" >&2
+            return 1
+        fi
         if systemctl is-active --quiet harbor-panel; then
             systemctl stop harbor-panel
             SERVICE_WAS_RUNNING=1
         fi
-    elif [ -f /etc/init.d/harbor-panel ] && rc-service harbor-panel status >/dev/null 2>&1; then
-        rc-service harbor-panel stop
-        SERVICE_WAS_RUNNING=1
+    elif [ -f /etc/init.d/harbor-panel ]; then
+        if ! cmp -s /etc/init.d/harbor-panel "$APP_DIR/deploy/harbor-panel.openrc"; then
+            echo "检测到手动修改的 Harbor Panel 服务文件，更新已停止，未覆盖配置。请先备份并迁移自定义设置。" >&2
+            return 1
+        fi
+        if rc-service harbor-panel status >/dev/null 2>&1; then
+            rc-service harbor-panel stop
+            SERVICE_WAS_RUNNING=1
+        fi
     fi
     if ! fetch_source; then
         echo "更新源码失败。" >&2
@@ -364,6 +428,7 @@ update_panel() {
         done < "$PORT_FILE"
     fi
     configure_port "$selected_port"
+    menu_admin adopt "$0" || echo "未能验证卸载目录归属；请检查上述错误后再使用卸载。" >&2
     if command -v systemctl >/dev/null 2>&1; then
         install -m 644 "$APP_DIR/deploy/harbor-panel.service" /etc/systemd/system/harbor-panel.service
         systemctl daemon-reload
@@ -378,71 +443,47 @@ update_panel() {
     echo "更新完成，配置文件、工作区和审计数据已保留。"
 }
 
+set_shortcut() {
+    printf '请输入自定义快捷命令（可以使用中文）: '
+    IFS= read -r shortcut || return 0
+    menu_admin shortcut "$shortcut" "$CALLER_PATH" "$0"
+}
+
 uninstall_panel() {
     if [ ! -f "$APP_DIR/server.py" ]; then
         echo "未发现已安装的 Harbor Panel。"
-        return
-    fi
-    case "$APP_DIR" in
-        /|/opt|/srv|/usr|/etc|/var|/home)
-            echo "拒绝卸载不安全的程序目录: $APP_DIR" >&2
-            return 1
-            ;;
-    esac
-    printf '确认卸载程序并使管理员账户和注册凭证失效（保留工作区、审计数据和环境配置）请输入 UNINSTALL: '
-    read answer
-    if [ "$answer" != "UNINSTALL" ]; then
-        echo "已取消。"
-        return
-    fi
-    if command -v systemctl >/dev/null 2>&1; then
-        if systemctl is-active --quiet harbor-panel; then
-            if ! systemctl stop harbor-panel; then
-                echo "无法停止 Harbor Panel；为避免旧登录会话继续有效，未卸载任何文件。" >&2
-                return 1
-            fi
-        fi
-        if systemctl is-active --quiet harbor-panel; then
-            echo "Harbor Panel 仍在运行；为避免旧登录会话继续有效，未卸载任何文件。" >&2
-            return 1
-        fi
-        systemctl disable harbor-panel 2>/dev/null || true
-        rm -f /etc/systemd/system/harbor-panel.service
-        if ! systemctl daemon-reload; then
-            echo "systemd 无法重新加载配置；程序与凭证尚未删除。" >&2
-            return 1
-        fi
-    elif [ -f /etc/init.d/harbor-panel ]; then
-        if rc-service harbor-panel status >/dev/null 2>&1; then
-            if ! rc-service harbor-panel stop; then
-                echo "无法停止 Harbor Panel；为避免旧登录会话继续有效，未卸载任何文件。" >&2
-                return 1
-            fi
-        fi
-        if rc-service harbor-panel status >/dev/null 2>&1; then
-            echo "Harbor Panel 仍在运行；为避免旧登录会话继续有效，未卸载任何文件。" >&2
-            return 1
-        fi
-        rc-update del harbor-panel default 2>/dev/null || true
-        rm -f /etc/init.d/harbor-panel
-    else
-        echo "无法确认手动启动的服务已停止；请先停止 Harbor Panel，再使用受支持的服务管理器卸载。" >&2
         return 1
     fi
-    rm -rf "$APP_DIR"
-    rm -f "$TOKEN_FILE" "$STATE_DIR/auth.sqlite3" "$STATE_DIR/auth.sqlite3-wal" "$STATE_DIR/auth.sqlite3-shm"
-    echo "程序已卸载，旧注册凭证及管理员账户已失效。工作区、审计数据及 /etc/harbor-panel.env 已保留。重新安装会生成新的注册凭证。"
+    echo "卸载将永久停止并删除面板及其已验证的 WordPress/Caddy 服务和数据，不会删除反代的外部应用。"
+    echo "专用程序、状态、工作区、审计记录、账户/凭证、环境配置和快捷命令也将删除。"
+    while :; do
+        printf '先备份面板和网站数据？[Y/n，默认 Y]: '
+        IFS= read -r backup || return 0
+        case "$backup" in
+            ''|y|Y|yes|YES) backup=yes; break ;;
+            n|N|no|NO) backup=no; break ;;
+            *) echo "请输入 Y 或 N。" ;;
+        esac
+    done
+    printf '确认永久卸载请输入 UNINSTALL: '
+    IFS= read -r answer || return 0
+    if [ "$answer" != UNINSTALL ]; then
+        echo "已取消。"
+        return 0
+    fi
+    menu_admin uninstall "$backup" "$0"
 }
 
 while :; do
     printf '\nHarbor Panel 管理菜单\n'
-    printf '1. 安装\n2. 更新\n3. 卸载\n0. 退出\n\n请选择: '
-    read choice
+    printf '1. 安装\n2. 更新\n3. 卸载\n5. 设置面板快捷\n0. 退出\n\n请选择: '
+    IFS= read -r choice || exit 0
     case "$choice" in
         1) install_panel ;;
         2) update_panel ;;
-        3) uninstall_panel ;;
+        3) if uninstall_panel && [ ! -f "$APP_DIR/server.py" ]; then exit 0; fi ;;
+        5) set_shortcut || : ;;
         0) exit 0 ;;
-        *) echo "无效选项，请输入 1、2、3 或 0。" ;;
+        *) echo "无效选项，请输入 1、2、3、5 或 0。" ;;
     esac
 done
