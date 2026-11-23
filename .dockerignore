@@ -8,6 +8,7 @@
 !appearance.py
 !terminal.py
 !local_ssh.py
+!sites.py
 !LICENSE
 !web/
 !web/index.html

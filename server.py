@@ -24,6 +24,7 @@ from files import FileStore, PanelError
 from host import Host
 from appearance import AppearanceStore
 from terminal import TerminalManager
+from sites import SiteManager
 
 
 BASE = Path(__file__).resolve().parent
@@ -200,6 +201,8 @@ class PanelServer(ThreadingHTTPServer):
             self.secure_cookie = True
         self.allowed_hosts = {urlsplit(origin).netloc.lower() for origin in self.origins}
         try:
+            self.sites = SiteManager(state, self.full_host_root, self.audit, port,
+                                     {urlsplit(origin).hostname for origin in self.origins}, self.secure_cookie)
             self.host = Host(self.files.root, full_host=full_host)
         except Exception:
             self.server_close()
@@ -419,6 +422,14 @@ class Handler(BaseHTTPRequestHandler):
     def _get_api(self, path, relative, query, session):
         if path == "/api/session":
             result = {"csrf": session["csrf"], "version": "0.1.0", "file_root": str(self.server.files.root), "platform": os.name, "commands": list(Host.COMMANDS), "full_host": self.server.full_host, "full_host_root": self.server.full_host_root, "public_http": self.server.public_bind and not self.server.secure_cookie, "https_remote_ssh": self.server.secure_cookie}
+        elif path == "/api/sites":
+            result = self.server.sites.overview()
+        elif path == "/api/sites/environment":
+            result = self.server.sites.environment()
+        elif path == "/api/sites/scan":
+            result = self.server.sites.scan()
+        elif path == "/api/sites/job":
+            result = self.server.sites.job_status(reveal=query.get("reveal") == ["1"])
         elif path == "/api/appearance":
             result = self.server.appearance.get()
         elif path == "/api/appearance/background":
@@ -451,6 +462,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _write_api(self, path, address, token):
         routes = {("POST", "/api/logout"), ("POST", "/api/terminal"), ("POST", "/api/containers/action"), ("PUT", "/api/containers/config"), ("PUT", "/api/files/write"), ("POST", "/api/files/mkdir"), ("POST", "/api/appearance"), ("PUT", "/api/appearance/background"), ("POST", "/api/appearance/background/remove")}
+        if self.command == "POST" and path in ("/api/sites", "/api/sites/action", "/api/sites/environment"):
+            body = self._body()
+            if path == "/api/sites":
+                result = self.server.sites.create(body.get("domain"), body.get("kind"), body.get("upstream"), address)
+            elif path == "/api/sites/action":
+                result = self.server.sites.action(body.get("id"), body.get("action"), address)
+            else:
+                result = self.server.sites.set_environment(body.get("service"), body.get("action"), address)
+            self._respond(202, result)
+            return
         if (self.command, path) not in routes:
             raise PanelError("API route or method not found.", 404)
         if path == "/api/appearance/background" and self.command == "PUT":

@@ -18,7 +18,8 @@
 | 终端 | 浏览器内真实交互式 SSH，原生 root VPS 自动连接本机；HTTPS 下支持远程 root 密码连接、指纹确认、窗口缩放及持续输出 |
 | 外观主题 | 苔影花园、等高线、月下档案、陶土织纹四套图案主题；支持本机上传背景、切换和移除，重启后保留 |
 | 进程监控 | 真实 PID、进程名称、所属用户、状态、RSS；按内存降序显示前 150 个可访问进程 |
-| 操作审计 | 登录、退出、文件变更、SSH 连接/断开、外观及容器操作；不记录 SSH 密码与终端内容，SQLite 保留最近 10,000 条 |
+| 网站 | 原生 Linux 支持一键 WordPress、IP/端口与 HTTPS 域名反代、本机 TCP 监听列表、环境管理及 Let’s Encrypt 自动 HTTPS |
+| 操作审计 | 登录、退出、文件变更、SSH 连接/断开、外观、容器及网站操作；不记录 SSH 密码与终端内容，SQLite 保留最近 10,000 条 |
 | 入口保护 | 密码散列验证、登录限速、服务端会话、HttpOnly/SameSite Cookie、Origin/Host 校验、CSRF、CSP |
 
 界面支持中文、窄屏导航、功能搜索（Ctrl/Cmd K）、编辑器保存快捷键（Ctrl/Cmd S）。所有图表来自实际采样；Docker 不可用时明确显示错误，不填充演示数据。
@@ -177,7 +178,18 @@ location / {
 
 ### Docker 管理
 
-原生 Linux systemd/OpenRC 服务以 root 运行，可访问标准 Docker socket；Docker CLI 和 daemon 仍需由用户在 VPS 上安装并启动。若容器页仍报权限错误，先确认 Docker daemon 和 CLI 可用，再检查 systemd 是否有覆盖服务用户/文件系统权限的 drop-in：`systemctl cat harbor-panel` 和 `systemctl show -p User -p DynamicUser -p ProtectSystem harbor-panel`。**不要盲目删除现有 drop-in**；只调整你确认属于 Harbor Panel、且确实限制权限的设置。若面板信息页未显示“全主机 root”，说明当前进程没有实际以 root 运行。Compose 容器模式不挂载宿主机 Docker socket，仍无法管理宿主机 Docker。
+原生 Linux systemd/OpenRC 服务以 root 运行，可访问标准 Docker socket；Docker CLI 和 daemon 必须先在 VPS 上安装并启动，也可在「网站 → 环境管理」操作。若容器页仍报权限错误，先确认 Docker daemon 和 CLI 可用，再检查 systemd 是否有覆盖服务用户/文件系统权限的 drop-in：`systemctl cat harbor-panel` 和 `systemctl show -p User -p DynamicUser -p ProtectSystem harbor-panel`。**不要盲目删除现有 drop-in**；只调整你确认属于 Harbor Panel、且确实限制权限的设置。若面板信息页未显示“全主机 root”，说明当前进程没有实际以 root 运行。Compose 容器模式不挂载宿主机 Docker socket，仍无法管理宿主机 Docker。
+
+### 网站：站点管理与环境管理
+
+1. 原生 Linux root 部署中，打开「网站 → 环境管理」，先准备 Docker，再安装面板专用 Caddy。Debian/Ubuntu 和 Alpine 支持面板内安装 Docker；其他系统可使用手动安装的标准本机 Docker。启动和重启用 systemd 或 OpenRC。Docker 重启可能中断已有容器，请安排维护窗口。
+2. 将主域名的 DNS A 记录指向 VPS 的公网 IPv4；有 AAAA 记录时，IPv6 也必须指向同一台 VPS。开放公网 TCP 80/443，允许出站访问 Docker Hub 和 Let’s Encrypt。面板不会接管已占用 80/443 的 Web 服务，包括已有的面板 HTTPS 代理；请先规划端口，否则不能创建站点。默认 Compose 和 Windows 不启用宿主机网站管理。
+3. 打开「站点管理」右上角的「新建网站」，选 WordPress、IP/端口反代或域名反代，再点「一键创建」。专用 Caddy 异步申请并续签证书；创建成功表示路由已加载，不代表证书已签发。若等待后仍无法 HTTPS 访问，请检查 DNS、防火墙及 `docker logs harbor-panel-caddy`。
+
+- **IP/端口反代**：支持本机、内网、公网 IP 和域名加端口，例如 `127.0.0.1:3000`、`192.168.1.10:8080`。点击「扫描本机服务」只读取宿主机 TCP 监听和 Docker 已发布端口，不发探测请求；显示进程或容器/Compose 项目名，不保证每个端口都提供 HTTP。点选卡片可自动填入。Docker 名称示例 `app:80` 要求唯一匹配且目标容器端口已发布，建议绑定固定的回环端口。
+- **域名反代**：例如 `https://origin.example.com`，保留上游 HTTP Host 和 TLS 校验，不接受路径、查询参数或凭证。域名创建/启用时解析并固定到当时的 IP；上游地址有变化时可停用再启用站点以重新解析。不要将宿主机管理接口或不应公开的内网服务作为上游。
+- **WordPress**：先初始化随机管理员，再开放站点；MariaDB 不发布端口。HTTPS 面板会短暂显示凭证；也可以从可信 SSH 读取状态目录下 `websites/wordpress/<站点 ID>/admin-login`。默认状态目录为 `/var/lib/harbor-panel`。在网站 HTTPS 可用后登录并修改初始密码。不要把凭证放进截图或日志。
+- 停用只移除公开入口。移除 WordPress 站点会尝试清理专用容器和网络，保留文件及数据库卷，便于备份或手动恢复。更新或卸载面板不会删除网站状态、专用 Caddy 或站点容器；卸载面板不会让网站下线。若要关站，请先停用网站；若要永久清除，请先备份，再手动处理确认归属的容器、数据卷和状态文件。
 
 ### SSH 终端与外观
 
@@ -195,7 +207,7 @@ location / {
 - 除原生 Linux 全主机部署外，手动启动仍按当前操作系统账户与指定文件根目录运行；Docker 需要可用的 CLI 与 daemon。
 - 旧版 `/api/terminal` 诊断接口保持兼容，其命令仍受 30 秒与 1 MiB 限制；新的交互式 SSH 终端不使用该接口。
 - 主机历史暂存在内存，服务重启后清空。审计保存在本地 SQLite，既不是防篡改存储，也不是集中日志系统。
-- 尚未实现远程节点、网站/证书、服务配置、应用市场、备份调度、AI 助手与桌面窗口系统。
+- 尚未实现远程节点、服务配置、应用市场、备份调度、AI 助手与桌面窗口系统。
 
 ## 开发与测试
 
@@ -216,6 +228,7 @@ harbor-panel/
   terminal.py     已认证 WebSocket 与 SSH 会话
   local_ssh.py    原生 root 模式的独立回环 SSH 服务
   appearance.py   本机主题与背景图片存储
+  sites.py        网站任务、Caddy 配置与 WordPress 部署
   web/            原创中文管理界面，无构建步骤
   tests/          标准库 unittest 测试
   deploy/         Linux systemd 示例

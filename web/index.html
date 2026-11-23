@@ -38,6 +38,7 @@
     <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5 5-5 5 5M4 16v5h16v-5"/></symbol>
     <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v13m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
     <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1 1m12 12 1 1M5 19l1-1M18 6l1-1"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></symbol>
   </defs></svg>
 
   <div id="boot" class="boot"><span class="brand-mark">H<span>·</span></span><p>正在连接工作台…</p></div>
@@ -51,7 +52,7 @@
     <aside id="sidebar" class="sidebar"><a class="brand" href="#overview"><span class="brand-mark">H<span>·</span></span>harbor<span class="brand-panel">panel</span></a><p class="sidebar-label">工作空间</p><nav id="nav" aria-label="主导航"></nav><div class="sidebar-bottom"><div class="local-node"><span class="node-icon"><svg class="icon"><use href="#i-server"/></svg></span><div><strong id="sidebar-host">本地主机</strong><span><i class="status-dot"></i> 当前管理节点</span></div></div><div class="sidebar-note"><svg class="icon"><use href="#i-shield"/></svg><span>单机工作台 <small>Harbor Panel v0.1.0</small></span></div></div></aside>
     <button id="nav-overlay" class="nav-overlay" aria-label="关闭导航" hidden></button>
     <div class="main-shell"><header class="topbar"><div class="breadcrumb"><button id="menu-button" class="icon-button mobile-only" aria-label="打开导航"><svg class="icon"><use href="#i-menu"/></svg></button><span>工作空间</span><span class="slash">/</span><strong id="page-label">主机概览</strong></div><div class="topbar-actions"><button id="open-search" class="search-trigger"><svg class="icon"><use href="#i-search"/></svg><span>快速前往…</span><kbd>Ctrl K</kbd></button><span class="topbar-divider"></span><span class="admin-avatar">A</span><span class="admin-name">管理员</span><button id="logout" class="icon-button" aria-label="退出登录" title="退出登录"><svg class="icon"><use href="#i-exit"/></svg></button></div></header>
-      <main id="main" tabindex="-1"><div class="page-heading"><div><p class="eyebrow" id="page-kicker">WORKSPACE OVERVIEW</p><h1 id="page-title">主机概览</h1><p id="page-description" class="muted">一切尽在掌握，开始今天的运维。</p></div><div class="page-heading-actions"><span id="connection-badge" class="badge green"><i class="status-dot"></i> 实时连接</span><button id="refresh" class="button secondary"><svg class="icon"><use href="#i-refresh"/></svg>刷新</button></div></div><div id="view" aria-live="polite"></div><footer class="page-footer"><span>HARBOR PANEL <span class="footer-dot">·</span> 为日常运维留一点余裕</span><span id="last-updated">正在同步主机状态</span></footer></main>
+      <main id="main" tabindex="-1"><div class="page-heading"><div><p class="eyebrow" id="page-kicker">WORKSPACE OVERVIEW</p><h1 id="page-title">主机概览</h1><p id="page-description" class="muted">一切尽在掌握，开始今天的运维。</p></div><div class="page-heading-actions"><span id="connection-badge" class="badge green"><i class="status-dot"></i> 实时连接</span><button id="refresh" class="button secondary"><svg class="icon"><use href="#i-refresh"/></svg>刷新</button><button id="sites-create" class="button primary" type="button" data-sites-write hidden><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>新建网站</button></div></div><div id="view" aria-live="polite"></div><footer class="page-footer"><span>HARBOR PANEL <span class="footer-dot">·</span> 为日常运维留一点余裕</span><span id="last-updated">正在同步主机状态</span></footer></main>
     </div>
   </div>
 
@@ -60,6 +61,44 @@
   <dialog id="output-dialog" class="output-dialog"><div class="dialog-heading"><h2 id="output-title">输出</h2><button class="icon-button" data-close="output-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"/></svg></button></div><pre id="output-content" tabindex="0"></pre></dialog>
   <dialog id="container-config-dialog" class="container-config-dialog"><form id="container-config-form"><div class="dialog-heading"><div><p class="eyebrow">DOCKER CONTAINER</p><h2 id="container-config-title">容器配置</h2></div><button type="button" class="icon-button" data-close="container-config-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"/></svg></button></div><input id="container-config-id" type="hidden"><div class="config-fields"><label>容器名称<input id="container-config-name" required maxlength="128"></label><label>镜像<input id="container-config-image" required maxlength="255" spellcheck="false"></label><label>启动命令（每行一个参数）<textarea id="container-config-command" rows="3" spellcheck="false"></textarea></label><label>端口映射（每行一条，如 8080:80/tcp）<textarea id="container-config-ports" rows="3" spellcheck="false"></textarea></label><label>环境变量（每行 KEY=value）<textarea id="container-config-environment" rows="4" spellcheck="false"></textarea></label><label>挂载（每行 source:target[:ro|rw]）<textarea id="container-config-volumes" rows="3" spellcheck="false"></textarea></label><label>网络（每行一个网络名）<textarea id="container-config-networks" rows="2" spellcheck="false"></textarea></label><label>重启策略<select id="container-config-restart"><option value="no">不自动重启</option><option value="always">总是</option><option value="unless-stopped">除非手动停止</option><option value="on-failure">失败时</option></select></label><label>内存限制（字节，0 表示不限制）<input id="container-config-memory" type="number" min="0" step="1" required></label><label>CPU 限制（核，0 表示不限制）<input id="container-config-cpu" type="number" min="0" max="1024" step="0.1" required></label></div><p class="config-warning">保存会停止并重建容器，容器 ID 将变化。挂载卷/目录的数据通常保留；未挂载的容器可写层数据可能丢失。新容器创建失败时，面板会尝试恢复旧容器。</p><div class="dialog-footer"><span class="muted">确认镜像、端口与挂载配置正确后再保存。</span><button id="container-config-save" class="button primary" type="submit">保存并重建</button></div></form></dialog>
   <dialog id="folder-dialog" class="folder-dialog"><form id="folder-form"><div class="dialog-heading"><h2>新建文件夹</h2><button type="button" class="icon-button" data-close="folder-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"/></svg></button></div><label for="folder-name">文件夹名称</label><input id="folder-name" required maxlength="200" placeholder="例如 backups"><p class="muted">创建于当前目录下。</p><button class="button primary" type="submit">创建文件夹</button></form></dialog>
+  <dialog id="site-dialog" class="site-dialog" aria-labelledby="site-dialog-title">
+    <form id="site-form" autocomplete="off">
+      <div class="dialog-heading"><div><p class="eyebrow">NEW WEBSITE</p><h2 id="site-dialog-title">新建网站</h2></div><button type="button" class="icon-button" data-close="site-dialog" aria-label="关闭"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button></div>
+      <div class="site-form-body">
+        <div class="site-field">
+          <label for="site-domain">1. 主域名</label>
+          <input id="site-domain" required maxlength="253" placeholder="www.example.com" spellcheck="false" autocapitalize="off" aria-describedby="site-domain-help">
+          <p id="site-domain-help" class="muted">将域名的 A / AAAA 记录指向本机对应的公网 IPv4 / IPv6 地址。请确保公网可以访问 TCP 80 和 443。</p>
+        </div>
+        <fieldset id="site-kind-options" class="site-field">
+          <legend>2. 站点服务</legend>
+          <div class="site-kind-grid">
+            <label class="site-choice"><input type="radio" name="site-kind" value="wordpress" checked><span><strong>WordPress</strong><small>一键部署，开放域名前初始化管理员</small></span></label>
+            <label class="site-choice"><input type="radio" name="site-kind" value="proxy"><span><strong>IP / 端口反代</strong><small>代理本机、内网或 Docker Web 服务</small></span></label>
+            <label class="site-choice"><input type="radio" name="site-kind" value="https"><span><strong>域名反代</strong><small>代理其他域名提供的 HTTPS 服务</small></span></label>
+          </div>
+        </fieldset>
+        <p id="site-wordpress-note" class="section-note">WordPress 不需要上游地址。管理员会在站点公开前初始化，无需在公网运行安装向导。</p>
+        <div id="site-upstream-field" class="site-field" hidden>
+          <label for="site-upstream">3. 上游地址</label>
+          <input id="site-upstream" maxlength="275" spellcheck="false" autocapitalize="off" aria-describedby="site-upstream-help site-exposure-warning" disabled>
+          <p id="site-upstream-help" class="muted"></p>
+          <p id="site-exposure-warning" class="site-warning">反代可能将本机或内网服务暴露到公网。请确认该服务允许公开，并已配置必要的访问控制。</p>
+          <section id="site-scan" class="site-scan" aria-labelledby="site-scan-title" hidden>
+            <div class="site-scan-heading"><div><h3 id="site-scan-title">本机 Web 服务</h3><p class="muted">读取 TCP 监听端口；点选结果填入上游地址。扫描不会验证端口上是否提供 HTTP 服务。</p></div><button id="site-scan-button" type="button" class="button secondary"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>扫描本机服务</button></div>
+            <p id="site-scan-status" class="muted" role="status" hidden></p><ul id="site-scan-results" class="site-scan-results" hidden></ul>
+          </section>
+        </div>
+        <p id="site-form-error" class="error-text" role="alert" hidden></p>
+      </div>
+      <div class="dialog-footer"><span class="muted">Let’s Encrypt 自动申请和续期；HTTPS 可能不会立即可用。</span><button id="site-submit" class="button primary" type="submit" data-sites-write>一键创建</button></div>
+    </form>
+  </dialog>
+  <dialog id="site-credentials-dialog" class="site-dialog site-credentials-dialog" aria-labelledby="site-credentials-title">
+    <div class="dialog-heading"><h2 id="site-credentials-title">WordPress 管理员凭据</h2><button type="button" class="icon-button" data-close="site-credentials-dialog" aria-label="关闭"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button></div>
+    <div class="site-form-body"><p class="site-warning">WordPress 安装已完成。请立即将凭据保存到密码管理器；下一次网站任务开始或面板重启后，将无法从这里取回。</p><dl class="site-credentials"><dt>用户名</dt><dd id="site-credentials-username" class="mono"></dd><dt>密码</dt><dd id="site-credentials-password" class="mono"></dd></dl></div>
+    <div class="dialog-footer"><button type="button" class="button secondary" data-close="site-credentials-dialog">关闭</button></div>
+  </dialog>
   <div id="toast" class="toast" role="status" hidden></div>
 </body>
 </html>

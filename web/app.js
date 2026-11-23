@@ -7,6 +7,7 @@ const views = {
   overview: { title: "主机概览", kicker: "WORKSPACE OVERVIEW", description: "一切尽在掌握，开始今天的运维。", icon: "grid" },
   files: { title: "文件管理", kicker: "FILE WORKSPACE", description: "浏览、创建和编辑文件，让每一份配置各就其位。", icon: "folder" },
   containers: { title: "Docker 容器", kicker: "CONTAINER MANAGEMENT", description: "连接本机 Docker，管理容器生命周期与日志。", icon: "box" },
+  sites: { title: "网站", kicker: "WEBSITE MANAGEMENT", description: "部署 WordPress、配置反向代理并管理网站运行环境。", icon: "globe" },
   terminal: { title: "终端", kicker: "INTERACTIVE SSH", description: "通过 SSH 直接操作本机 VPS，或安全连接其他服务器。", icon: "terminal" },
   processes: { title: "进程监控", kicker: "PROCESS MONITOR", description: "查看正在运行的进程，按内存占用排序。", icon: "activity" },
   audit: { title: "操作审计", kicker: "ACTIVITY & AUDIT", description: "每一次登录与管理操作，都有迹可循。", icon: "shield" },
@@ -78,6 +79,8 @@ function toast(message, error = false) {
 
 function showLogin() {
   disposeTerminal();
+  disposeSites();
+  sitesMutation = null;
   state.csrf = "";
   state.session = null;
   state.appearance = { theme: "botanical", has_background: false };
@@ -123,10 +126,10 @@ async function refreshAuthForm() {
 
 async function api(path, options = {}) {
   const session = state.session;
-  const { method = "GET", body, login = false } = options;
+  const { method = "GET", body, login = false, signal, cache } = options;
   const headers = { Accept: "application/json" };
   if (method !== "GET") { headers["Content-Type"] = "application/json"; headers["X-CSRF-Token"] = state.csrf; }
-  const response = await fetch(`/api/${path}`, { method, headers, credentials: "same-origin", body: body === undefined ? undefined : JSON.stringify(body) });
+  const response = await fetch(`/api/${path}`, { method, headers, credentials: "same-origin", signal, cache, body: body === undefined ? undefined : JSON.stringify(body) });
   let data;
   try { data = await response.json(); }
   catch { throw new Error(`服务器返回了无效响应（HTTP ${response.status}）。`); }
@@ -141,7 +144,7 @@ async function api(path, options = {}) {
 }
 
 function renderNav() {
-  $("nav").innerHTML = Object.entries(views).map(([key, view], index) => `${index === 5 ? '<div class="nav-divider"></div><span class="nav-caption">管理与记录</span>' : ""}<a class="nav-link" data-nav="${key}" href="#${key}">${icon(view.icon)}${view.title}</a>`).join("");
+  $("nav").innerHTML = Object.entries(views).map(([key, view]) => `${key === "audit" ? '<div class="nav-divider"></div><span class="nav-caption">管理与记录</span>' : ""}<a class="nav-link" data-nav="${key}" href="#${key}">${icon(view.icon)}${view.title}</a>`).join("");
 }
 
 function setConnection(online) {
@@ -171,8 +174,9 @@ function viewError(error) {
 async function navigate() {
   if (!state.session) return;
   const requested = location.hash.slice(1);
-  const nextView = Object.hasOwn(views, requested) ? requested : "overview";
+  const nextView = requested === "sites/environment" ? "sites" : Object.hasOwn(views, requested) ? requested : "overview";
   if (state.view === "terminal") disposeTerminal();
+  if (state.view === "sites") disposeSites();
   state.view = nextView;
   const view = views[state.view];
   const generation = ++state.generation;
@@ -203,6 +207,8 @@ async function navigate() {
       if (generation !== state.generation) return;
       state.containers = data.containers;
       renderContainers();
+    } else if (state.view === "sites") {
+      await openSites(requested === "sites/environment");
     } else if (state.view === "terminal") {
       renderTerminal();
     } else if (state.view === "appearance") {
@@ -419,6 +425,367 @@ async function containerAction(index, action, button) {
   finally { button.disabled = false; }
 }
 
+const siteKinds = { wordpress: "WordPress", proxy: "IP / 端口反代", https: "域名反代" };
+const siteJobLabels = { running: "任务进行中", done: "任务已完成", failed: "任务失败" };
+let sitesPage = null;
+let sitesMutation = null;
+let siteDraft = null;
+
+function disposeSites() {
+  if (sitesPage) {
+    clearTimeout(sitesPage.timer);
+    sitesPage.controller.abort();
+    sitesPage = null;
+  }
+  closeSiteDraft();
+  clearSiteCredentials();
+  $("sites-create").hidden = true;
+}
+
+function openSites(environment) {
+  const page = sitesPage = { environment, controller: new AbortController(), snapshot: null, job: null };
+  $("view").innerHTML = `<nav class="sites-tabs" aria-label="网站管理">
+    <a href="#sites"${environment ? "" : ' aria-current="page"'}>${icon("globe")}站点管理</a>
+    <a href="#sites/environment"${environment ? ' aria-current="page"' : ""}>${icon("server")}环境管理</a>
+  </nav><div id="sites-job" class="sites-job panel" hidden><div><span id="sites-job-status" class="badge"></span><p id="sites-job-message"></p></div>
+    <button id="sites-show-credentials" class="button secondary" type="button" hidden>查看管理员凭据</button>
+  </div><div id="sites-content" class="loading">正在读取网站数据…</div>`;
+  $("sites-create").hidden = environment;
+  return syncSites(page, true);
+}
+
+function siteJobKey(job) {
+  return job ? `${job.id}:${job.status}` : "";
+}
+
+function updateSitesControls(page) {
+  const disabled = !canWriteSites(page);
+  document.querySelectorAll("[data-sites-write]").forEach((button) => { button.disabled = disabled; });
+  $("sites-show-credentials").disabled = Boolean(page.syncing || sitesMutation);
+  $("site-kind-options").disabled = $("site-domain").disabled = Boolean(siteDraft?.submitting);
+  $("site-upstream").disabled = !siteDraft || siteDraft.kind === "wordpress" || Boolean(siteDraft.submitting);
+  $("site-scan-button").disabled = Boolean(siteDraft?.scan || siteDraft?.submitting);
+}
+
+function canWriteSites(page) {
+  return Boolean(page && page === sitesPage && page.snapshot?.supported === true && !page.snapshotError && !page.jobError && !page.syncing && !page.reload && !sitesMutation && page.job?.status !== "running");
+}
+
+function renderSitesJob(page) {
+  const job = page.job;
+  $("sites-job").hidden = page.snapshot?.supported === false || (!job && !sitesMutation && !page.jobError);
+  const status = page.jobError ? "状态暂不可用" : sitesMutation ? "正在提交任务" : (job ? siteJobLabels[job.status] : "");
+  const badge = $("sites-job-status");
+  badge.className = `badge ${page.jobError ? "amber" : sitesMutation ? "neutral" : job?.status === "done" ? "green" : job?.status === "failed" ? "red" : "amber"}`;
+  badge.textContent = status;
+  $("sites-job-message").textContent = page.jobError ? `无法检查网站任务，将自动重试：${page.jobError}` : sitesMutation ? "请稍候。" : page.hasCredentials ? "WordPress 已安装。请尽快查看并保存管理员凭据。" : job?.message || "";
+  $("sites-show-credentials").hidden = !page.hasCredentials || Boolean(sitesMutation || page.jobError);
+}
+
+async function syncSites(page, full = false, reveal = false) {
+  if (page !== sitesPage || !page || document.hidden) return;
+  if (page.syncing) { page.reload ||= full; return; }
+  clearTimeout(page.timer);
+  page.syncing = true;
+  updateSitesControls(page);
+  const options = { signal: page.controller.signal, cache: "no-store" };
+  try {
+    const previous = siteJobKey(page.job);
+    let credentials = null;
+    page.hasCredentials = false;
+    try {
+      const { job } = await api(reveal ? "sites/job?reveal=1" : "sites/job", options);
+      if (page !== sitesPage) return;
+      if (job !== null && (!job || !Object.hasOwn(siteJobLabels, job.status))) throw new Error("网站任务响应格式无效。");
+      page.hasCredentials = job?.status === "done" && job.has_credentials === true;
+      if (reveal && page.hasCredentials && typeof job.credentials?.username === "string" && typeof job.credentials?.password === "string") credentials = job.credentials;
+      page.job = job && { id: job.id, status: job.status, message: job.message };
+      page.jobError = "";
+    } catch (error) {
+      if (page !== sitesPage) return;
+      page.jobError = error.message;
+    }
+    if (!page.hasCredentials || previous !== siteJobKey(page.job)) clearSiteCredentials();
+    if (reveal && !document.hidden && !sitesMutation) {
+      if (credentials) {
+        $("site-credentials-username").textContent = credentials.username;
+        $("site-credentials-password").textContent = credentials.password;
+        $("site-credentials-dialog").showModal();
+      } else if (!page.jobError) toast("管理员凭据已不可用。", true);
+    }
+    renderSitesJob(page);
+    if (full || !page.snapshot || page.snapshotError || previous !== siteJobKey(page.job)) {
+      try {
+        const data = await api(page.environment ? "sites/environment" : "sites", options);
+        if (page !== sitesPage) return;
+        if (typeof data.supported !== "boolean") throw new Error("网站数据响应格式无效。");
+        const { supported, sites, docker, caddy, ports } = data;
+        page.snapshot = { supported, sites, docker, caddy, ports };
+        page.snapshotError = "";
+      } catch (error) {
+        if (page !== sitesPage) return;
+        page.snapshotError = error.message;
+      }
+      renderSitesContent(page);
+      renderSitesJob(page);
+    }
+  } finally {
+    if (page === sitesPage) {
+      page.syncing = false;
+      updateSitesControls(page);
+      if (page.reload || (page.snapshot?.supported !== false && (page.job?.status === "running" || page.jobError || page.snapshotError))) {
+        const reload = page.reload;
+        page.reload = false;
+        page.timer = setTimeout(() => syncSites(page, reload), reload ? 0 : 2000);
+      }
+    }
+  }
+}
+
+function renderSitesContent(page) {
+  const content = $("sites-content");
+  content.className = "";
+  if (page.snapshotError) {
+    content.innerHTML = `<section class="panel">${empty("暂时无法读取网站数据", page.snapshotError, "globe")}<div class="dialog-footer"><button class="button secondary" type="button" data-sites-retry>重新加载</button></div></section>`;
+  } else if (page.snapshot.supported !== true) {
+    content.innerHTML = `<section class="panel">${empty("当前部署不支持网站管理", "请在支持网站管理的主机环境中使用此功能。", "globe")}</section>`;
+  } else {
+    content.innerHTML = page.environment ? renderSiteEnvironment(page.snapshot) : renderSiteList(page.snapshot.sites);
+  }
+}
+
+function renderSiteList(sites) {
+  const rows = Array.isArray(sites) ? sites : [];
+  return `<div class="section-note">请先将域名的 A / AAAA 记录指向本机公网 IP，并开放 TCP 80 / 443。启用站点后，Let’s Encrypt 会自动申请和续期证书；任务完成不代表 HTTPS 已就绪。</div>
+    <section class="panel"><div class="toolbar"><div class="toolbar-group">${icon("globe")}<h2 class="site-table-title">网站列表</h2></div><span class="badge neutral">${rows.length} 个</span></div>
+    ${rows.length ? `<div class="table-scroll"><table><thead><tr><th scope="col">主域名</th><th scope="col">站点服务</th><th scope="col">上游地址</th><th scope="col">路由状态</th><th scope="col">操作</th></tr></thead><tbody>
+    ${rows.map((site, index) => `<tr><td class="mono">${escapeHTML(site.domain)}</td><td>${Object.hasOwn(siteKinds, site.kind) ? siteKinds[site.kind] : "未知类型"}</td><td class="mono cell-secondary">${escapeHTML(site.upstream || "—")}</td><td><span class="badge ${site.enabled ? "green" : "neutral"}">${site.enabled ? "已启用" : "已停用"}</span></td><td><div class="site-actions"><button class="button secondary" type="button" data-sites-write data-site-index="${index}" data-action="${site.enabled ? "disable" : "enable"}">${site.enabled ? "停用" : "启用"}</button><button class="button secondary site-remove" type="button" data-sites-write data-site-index="${index}" data-action="remove">移除</button></div></td></tr>`).join("")}
+    </tbody></table></div>` : empty("还没有网站", "点击右上角「新建网站」部署 WordPress 或添加反向代理。", "globe")}</section>
+    <p class="sites-footnote muted">停用仅关闭公开入口。移除 WordPress 会尝试清理专用容器和网络，但保留数据卷。</p>`;
+}
+
+function renderSiteEnvironment(data) {
+  const docker = data.docker || {};
+  const caddy = data.caddy || {};
+  const manager = docker.manager === "systemd" ? "systemd" : docker.manager === "openrc" ? "OpenRC" : "";
+  const canInstallDocker = ["apk", "apt-get"].includes(docker.package_manager);
+  const canManageDocker = docker.installed ? Boolean(manager) : canInstallDocker;
+  const dockerNote = !manager ? "未检测到 systemd 或 OpenRC，请在 VPS 上手动管理 Docker。" : !docker.installed && !canInstallDocker ? "此系统不支持面板内安装 Docker，请先在 VPS 上手动安装。" : `服务管理器：${manager}`;
+  const ports = Array.isArray(data.ports) ? data.ports.filter((entry) => [80, 443].includes(Number(entry.port))) : [];
+  const serviceCard = (name, title, status, description, ready, note = "") => {
+    const action = !status.installed ? "install" : status.running ? "restart" : "start";
+    const label = action === "install" ? "安装并启动" : action === "start" ? "启动" : "重启";
+    return `<section class="panel site-env-card"><div class="panel-heading"><h2>${title}</h2><span class="badge ${status.running ? "green" : status.installed ? "amber" : "neutral"}">${status.running ? "运行中" : status.installed ? "已安装 · 未运行" : "未安装"}</span></div><div class="panel-body"><p>${description}</p>${note ? `<p class="muted">${note}</p>` : ""}${ready ? `<button class="button secondary" type="button" data-sites-write data-site-service="${name}" data-action="${action}">${label} ${title}</button>` : ""}</div></section>`;
+  };
+  return `<div class="section-note">先安装并启动 Docker，再安装面板专用 Caddy。Caddy 负责站点入口和 Let’s Encrypt 证书，不会接管现有的 Caddy 服务。</div>
+    <div class="site-env-grid">${serviceCard("docker", "Docker", docker, "为 WordPress 和面板专用 Caddy 提供容器运行环境。", canManageDocker, dockerNote)}
+    ${serviceCard("caddy", "Caddy", caddy, "面板专用的 Docker 实例，安装时会创建并启动。", docker.running, docker.running ? "" : "请先启动 Docker。")}</div>
+    <section class="panel site-ports"><div class="panel-heading"><h2>公网入口端口 · TCP 80 / 443</h2></div><div class="panel-body">
+    <p${ports.length ? ' class="site-warning"' : ""}>${ports.length ? "检测到其他服务占用 TCP 80 或 443。面板不会接管现有服务；请先确认端口归属。" : "未检测到其他服务占用 TCP 80 或 443。请另行确认防火墙和公网可达性。"}</p>
+    ${ports.length ? `<div class="table-scroll"><table><thead><tr><th scope="col">TCP 端口</th><th scope="col">监听地址</th><th scope="col">项目 / 进程</th></tr></thead><tbody>${ports.map((entry) => `<tr><td class="mono">${escapeHTML(entry.port)}</td><td class="mono">${escapeHTML(entry.address || "—")}</td><td>${escapeHTML(entry.project || "未知")}</td></tr>`).join("")}</tbody></table></div>` : ""}</div></section>`;
+}
+
+function clearSiteCredentials() {
+  $("site-credentials-username").textContent = "";
+  $("site-credentials-password").textContent = "";
+  if ($("site-credentials-dialog").open) $("site-credentials-dialog").close();
+}
+
+function siteFormError(message = "") {
+  const field = $("site-form-error");
+  field.textContent = message;
+  field.hidden = !message;
+}
+
+function openSiteDraft() {
+  if (!canWriteSites(sitesPage) || sitesPage.environment || $("site-dialog").open) return;
+  siteDraft = { kind: "wordpress", services: [], selected: -1 };
+  $("site-form").reset();
+  siteFormError();
+  updateSiteKind();
+  $("site-dialog").showModal();
+  $("site-domain").focus();
+}
+
+function closeSiteDraft() {
+  siteDraft?.scan?.abort();
+  siteDraft = null;
+  $("site-form").reset();
+  renderSiteScan();
+  siteFormError();
+  if ($("site-dialog").open) $("site-dialog").close();
+}
+
+function updateSiteKind() {
+  if (!siteDraft) return;
+  const kind = $("site-form").elements["site-kind"].value;
+  const upstream = $("site-upstream");
+  if (kind !== siteDraft.kind) {
+    siteDraft.scan?.abort();
+    Object.assign(siteDraft, { kind, scan: null, services: [], selected: -1, scanStatus: "" });
+    upstream.value = "";
+  }
+  siteFormError();
+  $("site-wordpress-note").hidden = kind !== "wordpress";
+  $("site-upstream-field").hidden = kind === "wordpress";
+  $("site-scan").hidden = kind !== "proxy";
+  upstream.required = kind !== "wordpress";
+  upstream.placeholder = kind === "https" ? "origin.example.com:8443" : "127.0.0.1:3000";
+  $("site-upstream-help").textContent = kind === "https"
+    ? "填写上游 DNS 主机名，可附带端口（默认 443）。使用 HTTPS 并验证上游证书。"
+    : "填写主机和端口，可加 http:// 或 https://。支持本机、内网、公网 IP 和域名；Docker 服务名必须唯一，且目标端口已发布到宿主机。";
+  renderSiteScan();
+  updateSitesControls(sitesPage);
+}
+
+function isSiteHostname(host, qualified = false) {
+  const labels = host.split(".");
+  return host.length <= 253 && (!qualified || labels.length > 1) && !/^\d+$/.test(labels[labels.length - 1]) &&
+    labels.every((label) => /^[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$/i.test(label));
+}
+
+function parseSiteUpstream(input, kind) {
+  const authority = /^(?:(https?):\/\/)?(\[[\da-f:.]+\]|[a-z\d._-]+)(?::(\d{1,5}))?$/i.exec(input.trim());
+  if (!authority) return "";
+  const [, scheme, host, port] = authority;
+  if (port && (Number(port) < 1 || Number(port) > 65535)) return "";
+  if (kind === "https") {
+    if ((scheme && scheme.toLowerCase() !== "https") || !isSiteHostname(host) || /^0x[\da-f]+$/i.test(host)) return "";
+    return host.toLowerCase() + (port ? `:${port}` : "");
+  }
+  if (kind !== "proxy" || !port) return "";
+  const ipv4 = /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host) && host.split(".").every((part) => String(Number(part)) === part && Number(part) <= 255);
+  const dockerName = !scheme && host.includes("_") && /^[a-z\d][a-z\d_-]{0,62}$/i.test(host);
+  if (!isSiteHostname(host) && !ipv4 && !dockerName && !host.startsWith("[")) return "";
+  try { new URL(`http://${host}:${port}`); }
+  catch { return ""; }
+  return `${scheme ? `${scheme.toLowerCase()}://` : ""}${host}:${port}`;
+}
+
+function renderSiteScan() {
+  const status = $("site-scan-status");
+  status.textContent = siteDraft?.scanStatus || "";
+  status.hidden = !status.textContent;
+  const list = $("site-scan-results");
+  const services = siteDraft?.services || [];
+  list.hidden = !services.length;
+  list.innerHTML = services.map((entry, index) => {
+    const upstream = typeof entry.upstream === "string" && parseSiteUpstream(entry.upstream, "proxy");
+    return `<li><button type="button" class="site-scan-option" data-site-scan-index="${index}" aria-pressed="false"${upstream ? "" : " disabled"}><strong>${escapeHTML(entry.project || "未知项目")}</strong><span class="badge neutral">TCP ${escapeHTML(entry.port)}</span><small class="mono">${escapeHTML(entry.address || "—")}${upstream ? ` → ${escapeHTML(upstream)}` : " · 无可用上游地址"}</small></button></li>`;
+  }).join("");
+}
+
+async function scanSiteServices() {
+  const draft = siteDraft;
+  if (!draft || draft.kind !== "proxy" || draft.scan || draft.submitting || !$("site-dialog").open) return;
+  const controller = draft.scan = new AbortController();
+  draft.services = [];
+  draft.selected = -1;
+  draft.scanStatus = "正在读取本机 TCP 监听端口…";
+  renderSiteScan();
+  updateSitesControls(sitesPage);
+  try {
+    const data = await api("sites/scan", { signal: controller.signal, cache: "no-store" });
+    if (siteDraft !== draft || draft.scan !== controller || !$("site-dialog").open) return;
+    draft.services = Array.isArray(data.services) ? data.services.filter((entry) => entry && typeof entry === "object") : [];
+    draft.scanStatus = draft.services.length ? `发现 ${draft.services.length} 个监听项。` : "未找到本机 TCP 监听项，可手动填写上游地址。";
+    if (data.truncated) draft.scanStatus += " 结果已截断，可手动填写未列出的服务。";
+  } catch (error) {
+    if (siteDraft === draft && draft.scan === controller) draft.scanStatus = `扫描失败：${error.message}`;
+  } finally {
+    if (siteDraft === draft && draft.scan === controller && $("site-dialog").open) {
+      draft.scan = null;
+      renderSiteScan();
+      updateSitesControls(sitesPage);
+    }
+  }
+}
+
+function selectSiteService(index) {
+  if (siteDraft?.kind !== "proxy" || siteDraft.submitting || !$("site-dialog").open) return;
+  const entry = siteDraft.services[index];
+  const upstream = typeof entry?.upstream === "string" && parseSiteUpstream(entry.upstream, "proxy");
+  if (!upstream) return;
+  $("site-upstream").value = upstream;
+  siteDraft.selected = index;
+  updateSiteScanSelection();
+  siteFormError();
+}
+
+function updateSiteScanSelection() {
+  $("site-scan-results").querySelectorAll("[data-site-scan-index]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(Number(button.dataset.siteScanIndex) === siteDraft?.selected));
+  });
+}
+
+async function postSiteTask(path, body, draft = null) {
+  const page = sitesPage;
+  if (!canWriteSites(page)) return;
+  if (page.hasCredentials && !window.confirm("新任务将清除上一项 WordPress 安装的管理员凭据。请先保存凭据。确定继续吗？")) return;
+  const mutation = sitesMutation = {};
+  clearSiteCredentials();
+  if (draft) draft.submitting = true;
+  renderSitesJob(page);
+  updateSitesControls(page);
+  try {
+    await api(path, { method: "POST", body });
+    if (draft && draft === siteDraft) closeSiteDraft();
+  } catch (error) {
+    if (sitesMutation !== mutation) return;
+    if (draft && draft === siteDraft && $("site-dialog").open) siteFormError(error.message);
+    else toast(error.message, true);
+  } finally {
+    if (sitesMutation === mutation) {
+      sitesMutation = null;
+      if (draft && draft === siteDraft) draft.submitting = false;
+      if (sitesPage) {
+        renderSitesJob(sitesPage);
+        await syncSites(sitesPage, true);
+      }
+    }
+  }
+}
+
+function submitSite(event) {
+  event.preventDefault();
+  if (!siteDraft || siteDraft.submitting || !canWriteSites(sitesPage)) return;
+  siteFormError();
+  const domain = $("site-domain").value.trim().toLowerCase().replace(/\.$/, "");
+  if (!isSiteHostname(domain, true)) {
+    siteFormError("请输入有效的主域名，例如 www.example.com；不要填写 IP、协议、端口或路径。");
+    $("site-domain").focus();
+    return;
+  }
+  const kind = siteDraft.kind;
+  if (!Object.hasOwn(siteKinds, kind)) return;
+  const body = { domain, kind };
+  if (kind !== "wordpress") {
+    body.upstream = parseSiteUpstream($("site-upstream").value, kind);
+    if (!body.upstream) {
+      siteFormError(kind === "https" ? "请输入有效的上游 DNS 主机名和可选端口，不要填写 IP、路径或登录信息。" : "请输入带端口的上游地址，可使用 HTTP 或 HTTPS，不要填写路径或登录信息。IPv6 地址请置于方括号内。");
+      $("site-upstream").focus();
+      return;
+    }
+  }
+  return postSiteTask("sites", body, siteDraft);
+}
+
+function changeSiteRoute(index, action) {
+  const page = sitesPage;
+  if (!canWriteSites(page) || page.environment || !["enable", "disable", "remove"].includes(action)) return;
+  const site = page.snapshot.sites?.[index];
+  if (!site || (typeof site.id !== "string" && typeof site.id !== "number")) return;
+  if (action === "remove" && !window.confirm(`确定移除 ${site.domain} 吗？${site.kind === "wordpress" ? " 将尝试清理 WordPress 专用容器和网络，保留数据卷。" : ""}`)) return;
+  return postSiteTask("sites/action", { id: site.id, action });
+}
+
+function changeSiteEnvironment(service, action) {
+  const page = sitesPage;
+  if (!canWriteSites(page) || !page.environment || !["docker", "caddy"].includes(service) || !["install", "start", "restart"].includes(action)) return;
+  if (action === "restart" && !window.confirm(`重启 ${service === "docker" ? "Docker" : "Caddy"} 可能短暂中断服务。确定继续吗？`)) return;
+  return postSiteTask("sites/environment", { service, action });
+}
+
 function terminalStatus(text, error = false) {
   const status = $("terminal-status");
   if (!status) return;
@@ -595,7 +962,7 @@ function renderInfo() {
 
 function searchViews() {
   const query = $("search-input").value.trim().toLowerCase();
-  const aliases = { overview: "cpu memory dashboard 监控", files: "file upload 编辑 上传", containers: "docker logs 容器 日志", terminal: "shell ssh pty 诊断 命令 远程服务器", processes: "process pid 进程", audit: "audit log 审计 记录", appearance: "theme background wallpaper 主题 外观 背景 图片", info: "setting settings 配置 信息" };
+  const aliases = { overview: "cpu memory dashboard 监控", files: "file upload 编辑 上传", containers: "docker logs 容器 日志", sites: "website sites wordpress caddy https 域名 反代 站点管理 环境管理 证书", terminal: "shell ssh pty 诊断 命令 远程服务器", processes: "process pid 进程", audit: "audit log 审计 记录", appearance: "theme background wallpaper 主题 外观 背景 图片", info: "setting settings 配置 信息" };
   const results = Object.entries(views).filter(([key, view]) => `${view.title} ${aliases[key]}`.toLowerCase().includes(query));
   $("search-results").innerHTML = results.map(([key, view]) => `<a class="search-result" href="#${key}" data-search-result>${icon(view.icon)}<div>${view.title}<small>${view.description}</small></div></a>`).join("") || empty("没有匹配的功能", "试试搜索「文件」「Docker」或「终端」。", "search");
 }
@@ -693,8 +1060,10 @@ $("refresh").addEventListener("click", async () => {
   if (state.refreshing) return;
   state.refreshing = true;
   $("refresh").disabled = true;
-  try { await navigate(); }
-  finally { state.refreshing = false; $("refresh").disabled = false; }
+  try {
+    if (sitesPage) await syncSites(sitesPage, true);
+    else await navigate();
+  } finally { state.refreshing = false; $("refresh").disabled = false; }
 });
 $("menu-button").addEventListener("click", () => { $("sidebar").classList.add("is-open"); $("nav-overlay").hidden = false; });
 $("nav-overlay").addEventListener("click", closeNav);
@@ -718,14 +1087,36 @@ $("folder-form").addEventListener("submit", async (event) => {
   finally { button.disabled = false; }
 });
 $("container-config-form").addEventListener("submit", saveContainerConfig);
+$("sites-create").addEventListener("click", openSiteDraft);
+$("site-form").addEventListener("submit", submitSite);
+$("site-kind-options").addEventListener("change", updateSiteKind);
+$("site-scan-button").addEventListener("click", scanSiteServices);
+$("site-dialog").addEventListener("cancel", (event) => { event.preventDefault(); closeSiteDraft(); });
+$("site-dialog").addEventListener("close", () => { if (!$("site-dialog").open && siteDraft) closeSiteDraft(); });
+$("site-credentials-dialog").addEventListener("cancel", (event) => { event.preventDefault(); clearSiteCredentials(); });
+$("site-credentials-dialog").addEventListener("close", () => { if (!$("site-credentials-dialog").open) clearSiteCredentials(); });
+$("site-domain").addEventListener("input", () => siteFormError());
+$("site-upstream").addEventListener("input", () => {
+  if (!siteDraft) return;
+  siteDraft.selected = -1;
+  updateSiteScanSelection();
+  siteFormError();
+});
 
 document.addEventListener("click", async (event) => {
   const target = event.target.closest("button, a");
   if (!target) return;
   try {
-    if (target.dataset.close) $(target.dataset.close).close();
+    if (target.dataset.close === "site-dialog") closeSiteDraft();
+    else if (target.dataset.close === "site-credentials-dialog") clearSiteCredentials();
+    else if (target.dataset.close) $(target.dataset.close).close();
     if (target.hasAttribute("data-search-result")) $("search-dialog").close();
     if (target.hasAttribute("data-retry")) await navigate();
+    if (target.hasAttribute("data-sites-retry")) await syncSites(sitesPage, true);
+    if (target.id === "sites-show-credentials") await syncSites(sitesPage, false, true);
+    if (target.hasAttribute("data-site-index")) await changeSiteRoute(Number(target.dataset.siteIndex), target.dataset.action);
+    if (target.hasAttribute("data-site-service")) await changeSiteEnvironment(target.dataset.siteService, target.dataset.action);
+    if (target.hasAttribute("data-site-scan-index")) selectSiteService(Number(target.dataset.siteScanIndex));
     if (target.hasAttribute("data-folder")) await loadFiles(target.dataset.folder);
     if (target.hasAttribute("data-entry")) {
       const generation = state.generation;
@@ -789,8 +1180,18 @@ document.addEventListener("keydown", (event) => {
 window.addEventListener("beforeunload", (event) => {
   if (state.editor && ($("editor-content").value !== state.editor.content || $("editor-name").value !== state.editor.path)) { event.preventDefault(); event.returnValue = ""; }
 });
-window.addEventListener("pagehide", disposeTerminal);
-window.addEventListener("pageshow", (event) => { if (event.persisted && state.view === "terminal" && state.session) navigate(); });
+document.addEventListener("visibilitychange", () => {
+  const page = sitesPage;
+  if (!page) return;
+  if (document.hidden) {
+    clearTimeout(page.timer);
+    clearSiteCredentials();
+  } else syncSites(page, true);
+});
+window.addEventListener("pagehide", () => { disposeTerminal(); disposeSites(); });
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted && state.session && (state.view === "terminal" || state.view === "sites")) navigate();
+});
 window.addEventListener("hashchange", navigate);
 renderNav();
 enterApp().catch((error) => { showLogin(); if (!error.message.includes("sign in")) $("login-error").textContent = error.message; });

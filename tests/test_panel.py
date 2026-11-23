@@ -199,6 +199,22 @@ class HTTPTests(unittest.TestCase):
                 self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
         self.assertEqual(self.request("GET", "/server.py")[0], 404)
 
+    def test_website_routes_require_login_and_csrf(self):
+        for path in ("", "/environment", "/job", "/scan"):
+            self.assertEqual(self.request("GET", "/api/sites" + path)[0], 401)
+        self.login()
+        status, body, headers = self.request("GET", "/api/sites")
+        self.assertEqual((status, body), (200, {"supported": False, "sites": [], "job": None}))
+        self.assertIn("no-store", headers["Cache-Control"])
+        self.assertEqual(self.request("GET", "/api/sites/scan")[0], 403)
+        body = {"domain": "test.example.org", "kind": "proxy", "upstream": "127.0.0.1:3000"}
+        self.assertEqual(self.request("POST", "/api/sites", body, headers={"X-CSRF-Token": "wrong"})[0], 403)
+        self.assertEqual(self.request("POST", "/api/sites", body)[0], 403)
+        job = {"job": {"id": "job-id", "status": "running"}}
+        with mock.patch.object(self.server.sites, "create", return_value=job) as create:
+            self.assertEqual(self.request("POST", "/api/sites", body)[:2], (202, job))
+        create.assert_called_once_with(body["domain"], body["kind"], body["upstream"], "127.0.0.1")
+
     def test_appearance_routes_require_login_and_csrf(self):
         self.assertEqual(self.request("GET", "/api/appearance")[0], 401)
         self.login()
