@@ -1,5 +1,9 @@
+import contextlib
+import hashlib
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import tarfile
@@ -101,6 +105,7 @@ class TestMenuAdmin(unittest.TestCase):
         w = admin.Websites.__new__(admin.Websites)
         w.wordpress = {SITE}
         w.has_proxy = True
+        w.orphaned = False
         self.assertEqual(w.owner('volume', DATA, None), SITE)  # legacy implicit named volume
         self.assertEqual(w.owner('container', WP, {admin.OWNER: SITE}), SITE)
         self.assertEqual(w.owner('volume', admin.CADDY + '-data', {admin.OWNER: 'proxy'}), 'proxy')
@@ -124,7 +129,7 @@ class TestMenuAdmin(unittest.TestCase):
                      'Mounts': [{'Type': 'volume', 'Name': DATA, 'Source': mountpoint}]}
         w = admin.Websites.__new__(admin.Websites)
         w.i = SimpleNamespace(trees=(PurePosixPath('/opt/panel'), PurePosixPath('/var/lib/panel')))
-        w.wordpress, w.has_proxy = {SITE}, False
+        w.wordpress, w.has_proxy, w.orphaned = {SITE}, False, False
         w.containers, w.networks, w.volumes = {}, {}, {}
         w.objects = Mock(side_effect=inspect_reply)
         w.names = Mock(side_effect=[['a' * 64], [], [DATA], []])
@@ -137,6 +142,7 @@ class TestMenuAdmin(unittest.TestCase):
 
     def test_archive_includes_wordpress_data_and_manifest(self):
         root, i = self.installation_fixture()
+        shutil.rmtree(i.app)
         (i.state / 'audit.sqlite3').write_bytes(b'audit fixture')
         volume = root / 'volume-data'
         volume.mkdir()
@@ -147,12 +153,13 @@ class TestMenuAdmin(unittest.TestCase):
         with patch.object(admin, 'BACKUPS', root / 'backups'), patch.object(admin, 'root_dirs'), \
                 patch.object(admin, 'no_mounts'), patch.object(admin, 'sync_directory'), \
                 patch.object(admin, 'write_exclusive', side_effect=lambda p, data, *a: p.write_bytes(data)):
-            backup = admin.archive_backup(i, [env], w)
+            backup = admin.archive_backup(i, [env], w, trees=[i.state])
         self.assertTrue((backup / 'RESTORE.txt').is_file())
         manifest = json.loads((backup / 'manifest.json').read_bytes())
         self.assertEqual(manifest['volumes'], [DATA])
         self.assertIn(str(env), manifest['host_files'])
         with tarfile.open(backup / 'harbor-panel.tar.gz') as file:
+            self.assertNotIn('panel/app', file.getnames())
             self.assertEqual(file.extractfile('panel/state/audit.sqlite3').read(), b'audit fixture')
             self.assertEqual(file.extractfile(f'docker-volumes/{DATA}/table').read(), b'data fixture')
 
@@ -192,7 +199,8 @@ class TestMenuAdmin(unittest.TestCase):
         sites.remove.side_effect = lambda: events.append('delete websites')
         with patch.dict('sys.modules', {'fcntl': fcntl}), patch.object(i, 'ownership'), \
                 patch.object(i, 'data', return_value={}), patch.object(admin, 'CONFIG', (env,)), \
-                patch.object(admin, 'root_file', return_value=True), patch.object(admin, 'host_jobs'), \
+                patch.object(admin, 'root_file', side_effect=lambda p, **kw: p.lstat() if p.exists() else None), \
+                patch.object(admin, 'host_jobs'), \
                 patch.object(admin, 'no_mounts'), patch.object(admin.os, 'O_NOFOLLOW', 0, create=True), \
                 patch.object(admin, 'Service', return_value=service), patch.object(admin, 'Websites', return_value=sites), \
                 patch.object(admin, 'archive_backup') as archive:
@@ -204,6 +212,139 @@ class TestMenuAdmin(unittest.TestCase):
         self.assertFalse(unit.exists())
         self.assertFalse(env.exists())
         self.assertTrue(unrelated.exists())
+
+    @contextlib.contextmanager
+    def recovery_fixture(self, root, i):
+        paths = root / 'harbor-panel.paths'
+        with patch.object(admin, 'PATHS', paths), patch.object(admin, 'CONFIG', (paths,)), \
+                patch.object(admin, 'OPENRC_LOG', root / 'panel.log'), patch.object(admin, 'SHORTCUTS', root / 'bin'), \
+                patch.object(admin, 'root_dirs', side_effect=lambda p, **kw: p.lstat()), \
+                patch.object(admin, 'root_file', side_effect=lambda p, **kw: p.lstat() if p.exists() else None), \
+                patch.object(admin, 'no_mounts'):
+            yield paths
+
+    def test_option_three_cleans_orphan_state_without_reinstalling(self):
+        root, i = self.installation_fixture()
+        shutil.rmtree(i.app)
+        (i.state / 'bootstrap.token').write_bytes(b'old token')
+        (i.state / 'workspace').mkdir()
+        menu = root / admin.DOWNLOAD
+        menu.write_bytes(b'current menu')
+        other = root / 'my-app'
+        other.mkdir()
+        with self.recovery_fixture(root, i) as paths:
+            paths.write_bytes(f'HARBOR_PANEL_DIR={i.app}\nHARBOR_PANEL_STATE={i.state}\n'.encode())
+            bin_dir = root / 'bin'
+            bin_dir.mkdir()
+            (bin_dir / 'panel').write_bytes(i.wrapper())
+            (bin_dir / 'other').write_bytes(b'another command')
+            sites = Mock(containers={}, networks={}, volumes={})
+            service = Mock(path=None, links={})
+            fcntl = SimpleNamespace(flock=Mock(), LOCK_EX=1, LOCK_NB=2)
+            log = io.StringIO()
+            with patch.dict('sys.modules', {'fcntl': fcntl}), patch.object(admin.os, 'O_NOFOLLOW', 0, create=True), \
+                    patch.object(admin, 'Service', return_value=service), \
+                    patch.object(admin, 'Websites', return_value=sites), contextlib.redirect_stdout(log), \
+                    patch('builtins.input', side_effect=['n', 'cancel', 'n', 'UNINSTALL']):
+                self.assertFalse(admin.cleanup_menu(i, str(menu)))
+                self.assertTrue((i.state / 'bootstrap.token').exists())
+                service.stop.assert_not_called()
+                self.assertTrue(admin.cleanup_menu(i, str(menu)))
+                self.assertFalse(admin.cleanup_menu(i, str(menu)))
+            self.assertIn(str(i.state), log.getvalue())
+            self.assertIn('未安装面板', log.getvalue())
+            self.assertNotIn('old token', log.getvalue())
+            self.assertFalse(paths.exists())
+            self.assertFalse(i.state.exists())
+            self.assertFalse(menu.exists())
+            self.assertFalse((bin_dir / 'panel').exists())
+            self.assertTrue((bin_dir / 'other').exists())
+            self.assertTrue(other.is_dir())
+            service.disable.assert_not_called()
+
+    def test_recovery_allows_missing_systemd_unit_but_blocks_running_unit(self):
+        service = admin.Service.__new__(admin.Service)
+        service.path, service.systemd, service.command = None, True, 'systemctl'
+        gone = 'LoadState=not-found\nActiveState=inactive\nFragmentPath=\nDropInPaths=\n'
+        with patch.object(admin, 'present', return_value=False), \
+                patch.object(admin, 'run', side_effect=[SimpleNamespace(stdout=gone),
+                    SimpleNamespace(stdout=gone.replace('inactive', 'active'))]):
+            self.assertFalse(service.active())
+            with self.assertRaisesRegex(admin.Unsafe, 'still registered or running'):
+                service.active()
+
+    def test_option_three_lists_verified_docker_only_residue(self):
+        root, i = self.installation_fixture()
+        for tree in i.trees:
+            shutil.rmtree(tree)
+        w = admin.Websites.__new__(admin.Websites)
+        w.wordpress, w.has_proxy, w.orphaned = set(), False, True
+        self.assertEqual(w.owner('network', WP, {admin.OWNER: SITE}), SITE)
+        self.assertEqual(w.owner('volume', DATA, {admin.OWNER: SITE}), SITE)
+        with self.assertRaisesRegex(admin.Unsafe, 'Cannot verify ownership'):
+            w.owner('volume', DATA, {})
+        w.containers, w.networks, w.volumes = {}, {WP: {'Id': 'a' * 64}}, {}
+        log = io.StringIO()
+        with self.recovery_fixture(root, i), patch.object(admin, 'Service', return_value=Mock(path=None, links={})), \
+                patch.object(admin, 'Websites', return_value=w) as discover, patch.object(admin, 'uninstall') as remove, \
+                patch('builtins.input', side_effect=['n', 'UNINSTALL']), contextlib.redirect_stdout(log):
+            self.assertTrue(admin.cleanup_menu(i, 'unknown.sh'))
+        discover.assert_called_once_with(i, recovery=True)
+        self.assertEqual(remove.call_args.kwargs['preview'], w.signature())
+        self.assertIn(WP, log.getvalue())
+        self.assertNotIn('?????', log.getvalue())
+
+    def test_option_three_refuses_unknown_or_replaced_state(self):
+        root, i = self.installation_fixture()
+        shutil.rmtree(i.app)
+        unknown = i.state / 'unrelated.txt'
+        unknown.touch()
+        with self.recovery_fixture(root, i) as paths:
+            paths.write_bytes(f'HARBOR_PANEL_DIR={i.app}\nHARBOR_PANEL_STATE={i.state}\n'.encode())
+            with self.assertRaisesRegex(admin.Unsafe, 'unrecognized contents'):
+                i.recovery_trees()
+            self.assertTrue(unknown.exists())
+            unknown.unlink()
+            marker = i.state / admin.MARKER
+            marker.write_text(json.dumps({'paths': [str(p) for p in i.trees],
+                                          'directories': [[10, 11], [10, 12]]}))
+            with self.assertRaisesRegex(admin.Unsafe, 'Directory identity'):
+                i.recovery_trees()
+            info = i.state.stat()
+            marker.write_text(json.dumps({'paths': [str(p) for p in i.trees],
+                                          'directories': [[10, 11], [info.st_dev, info.st_ino]]}))
+            self.assertEqual(i.recovery_trees(), [i.state])
+
+    def test_downloaded_menu_cleanup_runs_with_no_installed_helper(self):
+        sh = shutil.which('sh')
+        if sh is None:
+            self.skipTest('A POSIX shell is not available')
+        menu = (DEPLOY / 'menu.sh').read_text(encoding='utf-8')
+        root = self.fixture()
+        helper = root / 'helper.py'
+        helper.write_bytes((DEPLOY / 'menu_admin.py').read_bytes().replace(b'\r\n', b'\n'))
+        self.assertIn(f"helper_sha='{hashlib.sha256(helper.read_bytes()).hexdigest()}'", menu)
+        prompt = menu[menu.index('uninstall_panel()'):]
+        fake = '''
+APP_DIR=/not-a-real-harbor-test
+STATE_DIR=/not-a-real-harbor-state
+curl() {
+    for destination do :; done
+    if [ "$TAMPER" = yes ]; then printf tampered > "$destination"; else cp -- "$FIXTURE" "$destination"; fi
+}
+python3() { printf 'called cleanup: %s %s %s\\n' "$3" "$4" "$5"; }
+'''
+        for tamper in ('no', 'yes'):
+            with self.subTest(tamper=tamper):
+                env = dict(os.environ, FIXTURE=helper.as_posix(), TAMPER=tamper)
+                result = subprocess.run([sh, '-c', fake + prompt], input=b'3\n0\n', capture_output=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if tamper == 'yes':
+                    self.assertNotIn(b'called cleanup', result.stdout)
+                    self.assertIn('清理组件版本不匹配'.encode(), result.stderr)
+                else:
+                    self.assertIn(b'called cleanup: cleanup /not-a-real-harbor-test /not-a-real-harbor-state',
+                                  result.stdout)
 
     def test_active_or_failed_rollback_journal_blocks_uninstall(self):
         root, i = self.installation_fixture()

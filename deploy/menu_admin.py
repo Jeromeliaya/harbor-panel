@@ -23,6 +23,25 @@ CONFIG = (PATHS, Path('/etc/harbor-panel.port'), Path('/etc/harbor-panel.env'))
 SYSTEMD = Path('/etc/systemd/system/harbor-panel.service')
 OPENRC = Path('/etc/init.d/harbor-panel')
 OPENRC_LOG = Path('/var/log/harbor-panel.log')
+# Exact published service templates, including releases before ownership markers.
+UNIT_HASHES = {
+    'harbor-panel.service': {
+        '2c404943c4a4e6e0d4ae3f81402e226ac7ba58d41747b814e83834999f64e6cc',
+        '65587ef7aea701a7767c462a356fdce60e6f4c8ec2debf7b0cd65e3755904c3e',
+        '65fafe59a157043cdf11b39ccc68300a5075afab9a9d49c3f79e0872e881b993',
+        '99c60198c3704c015e49fe7fe3ee734af3bb930b0a739141479a07293075a421',
+        'be8aa127cc6bdda7b4482ea993c2d0af035d13089868c60a533145528e17bc27',
+        'dfc420d0de5a658d5c1a930f27fc23d8fa5cf3824e6d20560c7288751',
+        'e67fd0f3bb42aa0ae2590a7520585e91c62f653136fa1492785c4f1b05aef071',
+    },
+    'harbor-panel.openrc': {
+        '4501a68ef9cf3be59046f8bb3a3e236488189186e5ffc3b471793b6c5989e211',
+        '60e694f737b12e6e05ede1f734160feeaf359ec56a6e164ea296ddb900fbd355',
+        '965ccfef8653cb55175bb7b7c902ef1599e79be04d229fc1f2fecb73fc483176',
+        'af12123e22d99a9321e5cba141b5a6d4425b092b38d7822d8b807c979ca8bcd8',
+        'e51af30461505a586ce6054361e9fa2143e7ecfe97cfb790d75975b3c9ec7933',
+    },
+}
 SHORTCUTS = Path('/usr/local/bin')
 BACKUPS = Path('/root/harbor-panel-backups')
 DOWNLOAD = 'harbor-panel-menu.sh'
@@ -178,24 +197,64 @@ class Installation:
         if any(present(tree / MARKER) for tree in self.trees):
             self.ownership()
             return
-        # Legacy recognition requires the recorded pair, exact native unit and actual panel state, not server.py alone.
+        # Legacy adoption still requires both recorded directories and the exact installed service.
         self.saved_paths()
         self.tree_ids()
         Service(self, require_manager=False)
-        state_entries = set(p.name for p in self.state.iterdir())
-        legacy = {'audit.sqlite3', 'audit.sqlite3-wal', 'audit.sqlite3-shm', 'auth.sqlite3',
-                  'auth.sqlite3-wal', 'auth.sqlite3-shm', 'bootstrap.token', 'appearance.json', 'background-image',
-                  'ssh_known_hosts', 'local-ssh', 'websites', 'host-settings.jobs.json', 'host-settings.lock',
-                  'host-settings.worker.lock'}
-        require(state_entries <= legacy and state_entries & {'audit.sqlite3', 'auth.sqlite3', 'bootstrap.token'},
-                'Cannot verify legacy panel state; move unrelated files out or back up and migrate manually')
-        for name in state_entries & {'audit.sqlite3', 'auth.sqlite3', 'bootstrap.token'}:
+        self.verify_legacy_state()
+        self.ownership(claim=True)
+
+    def verify_legacy_state(self, *, recorded=False):
+        entries = {p.name for p in self.state.iterdir()}
+        primary = {'audit.sqlite3', 'auth.sqlite3', 'bootstrap.token'}
+        legacy = primary | {'audit.sqlite3-wal', 'audit.sqlite3-shm', 'auth.sqlite3-wal', 'auth.sqlite3-shm',
+                            'appearance.json', 'background-image', 'ssh_known_hosts', 'local-ssh', 'websites',
+                            'host-settings.jobs.json', 'host-settings.lock', 'host-settings.worker.lock'}
+        if recorded:
+            legacy |= {'workspace', RECORDS}
+        require(entries <= legacy and (bool(entries & primary) or recorded),
+                f'Cannot verify legacy panel state; unrecognized contents in {self.state}')
+        for name in entries & primary:
             source = self.state / name
             root_file(source)
             with source.open('rb') as handle:
                 require(name == 'bootstrap.token' or handle.read(16) == b'SQLite format 3\0',
                         f'Invalid panel database: {source}')
-        self.ownership(claim=True)
+
+    def recovery_trees(self):
+        recorded = present(PATHS)
+        if recorded:
+            self.saved_paths()
+        trees = [p for p in self.trees if present(p)]
+        ids = {}
+        markers = []
+        for tree in trees:
+            info = root_dirs(tree, private=tree == self.state)
+            ids[tree] = [info.st_dev, info.st_ino]
+            no_mounts(tree)
+            marker = tree / MARKER
+            if root_file(marker, optional=True):
+                data = json.loads(marker.read_bytes())
+                require(isinstance(data, dict) and data.get('paths') == [str(p) for p in self.trees],
+                        f'Unexpected directory ownership record: {marker}')
+                markers.append(data.get('directories'))
+        if markers:
+            for pair in markers:
+                require(isinstance(pair, list) and len(pair) == len(self.trees) and pair == markers[0]
+                        and all(pair[self.trees.index(p)] == ids[p] for p in trees),
+                        'Directory identity does not match the installation record')
+        else:
+            if self.state in trees:
+                self.verify_legacy_state(recorded=recorded)
+            if self.app in trees:
+                require((recorded and not any(self.app.iterdir())) or (
+                    root_file(self.app / 'server.py', optional=True)
+                    and any(root_file(source, optional=True)
+                            and hashlib.sha256(source.read_bytes()).hexdigest() in hashes
+                            for template, hashes in UNIT_HASHES.items()
+                            for source in (self.app / 'deploy' / template,))),
+                    f'Cannot verify legacy application directory: {self.app}')
+        return trees
 
     def data(self):
         if not root_file(self.records, optional=True):
@@ -256,7 +315,7 @@ class Installation:
                 raise
         print(f'快捷命令已设置：{name}。如 PATH、别名或函数遮蔽，请运行 {destination}（普通用户请用 sudo）。')
 
-    def download(self, raw):
+    def download(self, raw, *, launcher=False):
         path = Path(os.path.abspath(raw))
         if path.name != DOWNLOAD or any(within(path, tree) for tree in self.trees):
             return None
@@ -264,10 +323,10 @@ class Installation:
             info = root_file(path, optional=True, sticky=True)
             if info is None or info.st_size > 1024 * 1024:
                 return None
-            root_file(self.menu)
-            if path.read_bytes() == self.menu.read_bytes():
+            content = path.read_bytes()
+            if launcher or (root_file(self.menu, optional=True) and content == self.menu.read_bytes()):
                 return {'path': str(path), 'identity': file_id(info),
-                        'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+                        'sha256': hashlib.sha256(content).hexdigest()}
         except (Unsafe, OSError):
             pass
         return None
@@ -298,30 +357,66 @@ class Installation:
 
 
 class Service:
-    def __init__(self, installation, *, require_manager=True):
+    def __init__(self, installation, *, require_manager=True, recovery=False):
         self.i = installation
+        self.was_running = False
+        self.links = {}
         units = [(SYSTEMD, 'harbor-panel.service'), (OPENRC, 'harbor-panel.openrc')]
         found = [(path, template) for path, template in units if present(path)]
+        if recovery:
+            for pattern, target in (('/etc/systemd/system/*.wants/harbor-panel.service', SYSTEMD),
+                                    ('/etc/systemd/system/*.requires/harbor-panel.service', SYSTEMD),
+                                    ('/etc/runlevels/*/harbor-panel', OPENRC)):
+                for link in Path('/').glob(pattern[1:]):
+                    root_dirs(link.parent)
+                    require(link.is_symlink() and link.lstat().st_uid == 0 and link.resolve() == target,
+                            f'Unverified service enablement link: {link}')
+                    self.links[link] = target
+        if recovery and not found:
+            self.path = None
+            self.systemd = present(Path('/run/systemd/system'))
+            self.command = executable('systemctl') if self.systemd else None
+            self.check_missing_unit()
+            return
         require(len(found) == 1, 'Cannot verify exactly one installed Harbor Panel native service')
         self.path, template = found[0]
         self.systemd = self.path == SYSTEMD
         source = self.i.app / 'deploy' / template
-        root_file(self.path)
-        root_file(source)
-        require(source.read_bytes() == self.path.read_bytes(), f'Unexpected service config: {self.path}')
+        unit = root_file(self.path)
+        require(unit.st_size <= 64 * 1024, f'Unexpected service config: {self.path}')
+        content = self.path.read_bytes()
+        require((recovery and hashlib.sha256(content).hexdigest() in UNIT_HASHES[template])
+                or (root_file(source, optional=True) and source.read_bytes() == content),
+                f'Unexpected service config: {self.path}')
         self.command = executable('systemctl' if self.systemd else 'rc-service')
-        self.was_running = False
         if require_manager:
             require(self.command, 'Cannot verify the service is stopped without its native service manager')
             if self.systemd:
-                show = run([self.command, 'show', '--property=FragmentPath,DropInPaths', 'harbor-panel.service']).stdout
+                show = run([self.command, 'show', '--all', '--property=FragmentPath,DropInPaths',
+                            'harbor-panel.service']).stdout
                 properties = dict(line.split('=', 1) for line in show.splitlines() if '=' in line)
                 require(properties.get('FragmentPath') == str(self.path) and properties.get('DropInPaths') == '',
                         'Unexpected service fragment or drop-ins; verify them manually')
             else:
                 require(not present(Path('/etc/conf.d/harbor-panel')), 'Unexpected OpenRC overrides; verify them manually')
 
+    def check_missing_unit(self):
+        require(not present(OPENRC) and not present(SYSTEMD), 'Panel service file appeared during the scan')
+        require(not present(Path('/run/openrc/started/harbor-panel')),
+                'Stop the remaining OpenRC Harbor Panel service first')
+        if self.systemd:
+            require(self.command, 'Cannot verify the service without systemctl')
+            result = run([self.command, 'show', '--all', '--property=LoadState,ActiveState,FragmentPath,DropInPaths',
+                          'harbor-panel.service'], check=False)
+            properties = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+            require(properties == {'LoadState': 'not-found', 'ActiveState': 'inactive',
+                                   'FragmentPath': '', 'DropInPaths': ''},
+                    'A Harbor Panel unit is still registered or running; verify it before cleaning up')
+
     def active(self):
+        if self.path is None:
+            self.check_missing_unit()
+            return False
         if self.systemd:
             state = run([self.command, 'show', '--property=ActiveState', '--value', 'harbor-panel.service']).stdout.strip()
             require(state in {'active', 'inactive', 'failed'}, f'Cannot verify service state: {state}')
@@ -370,10 +465,11 @@ class Service:
 
 
 class Websites:
-    def __init__(self, installation):
+    def __init__(self, installation, *, recovery=False):
         self.i = installation
         self.state = installation.state / 'websites'
         self.proxy = self.state / 'proxy'
+        self.orphaned = recovery and not present(self.state)
         self.wordpress = set()
         self.has_proxy = False
         if present(self.state):
@@ -429,11 +525,12 @@ class Websites:
         suffixes = {'container': {'', '-db'}, 'network': {''}, 'volume': {'-files', '-database'}}
         proxy_names = {'container': {CADDY}, 'network': set(), 'volume': {CADDY + '-data', CADDY + '-config'}}
         if name in proxy_names[kind]:
-            require(label == 'proxy' and self.has_proxy, f'Cannot verify ownership of {kind}: {name}')
+            require(label == 'proxy' and (self.has_proxy or self.orphaned), f'Cannot verify ownership of {kind}: {name}')
             return 'proxy'
         match = WP_NAME.fullmatch(name)
         require(match and ('-' + match[2] if match[2] else '') in suffixes[kind]
-                and match[1] in self.wordpress and (label == match[1] or kind == 'volume' and label is None),
+                and ((label == match[1] and (match[1] in self.wordpress or self.orphaned))
+                     or kind == 'volume' and label is None and match[1] in self.wordpress),
                 f'Cannot verify ownership of {kind}: {name}')
         return match[1]
 
@@ -578,7 +675,7 @@ def sync_directory(path):
         os.close(fd)
 
 
-def archive_backup(i, files, websites):
+def archive_backup(i, files, websites, *, trees):
     root_dirs(BACKUPS.parent)
     BACKUPS.mkdir(mode=0o700, exist_ok=True)
     root_dirs(BACKUPS, private=True)
@@ -591,7 +688,7 @@ def archive_backup(i, files, websites):
                 'host_files': {str(path): 'host/' + path.as_posix().lstrip('/') for path in files},
                 'volumes': sorted(websites.volumes), 'containers': sorted(websites.containers),
                 'networks': sorted(websites.networks)}
-    entries = [(i.app, 'panel/app'), (i.state, 'panel/state')]
+    entries = [(tree, member) for tree, member in ((i.app, 'panel/app'), (i.state, 'panel/state')) if tree in trees]
     entries.extend((Path(path), member) for path, member in manifest['host_files'].items())
     entries.extend((Path(item['Mountpoint']), 'docker-volumes/' + name) for name, item in websites.volumes.items())
     count = 0
@@ -648,59 +745,149 @@ Do not start a new WordPress initialization over restored files or MariaDB data.
         raise
 
 
-def uninstall(i, backup, launch):
+class Cleanup:
+    def __init__(self, i, launch, *, recovery):
+        self.i = i
+        self.recovery = recovery
+        self.trees = i.recovery_trees() if recovery else list(i.trees)
+        if not recovery:
+            i.ownership()
+        self.service = Service(i, recovery=recovery)
+        data = i.data()
+        shortcut = i.old_shortcut(data.get('shortcut'))
+        self.files = [path for path in (*CONFIG, self.service.path, OPENRC_LOG)
+                      if path is not None and root_file(path, optional=True)]
+        if shortcut is not None:
+            self.files.append(shortcut)
+        if recovery and present(SHORTCUTS):
+            root_dirs(SHORTCUTS)
+            wrapper = i.wrapper()
+            for path in SHORTCUTS.iterdir():
+                if path in self.files or not shortcut_name(path.name):
+                    continue
+                try:
+                    info = root_file(path)
+                    if info.st_size == len(wrapper) and path.read_bytes() == wrapper:
+                        self.files.append(path)
+                except (OSError, Unsafe):
+                    continue
+        self.files.sort(key=lambda p: (p in CONFIG, p == PATHS, str(p)))
+        for path in self.files:
+            no_mounts(path)
+        self.file_ids = {p: self.identity(p, p.lstat()) for p in self.files}
+        self.tree_ids = {p: file_id(p.lstat())[:2] for p in self.trees}
+        self.links = self.service.links if recovery else {}
+        download = i.download(launch, launcher=recovery)
+        self.downloads = {d['path']: d for d in (data.get('download'), download) if d}
+        if Path(launch).name == DOWNLOAD and not download:
+            print('当前下载脚本未能验证归属或内容，不会自动删除。', file=sys.stderr)
+
+    @staticmethod
+    def identity(path, info):
+        identity = file_id(info)
+        return identity[:2] if path == OPENRC_LOG else identity
+
+    def websites(self):
+        return Websites(self.i, recovery=self.recovery)
+
+    def verify(self):
+        i = self.i
+        if self.recovery:
+            require(i.recovery_trees() == self.trees, 'Installation paths changed during uninstall')
+        else:
+            i.ownership()
+        for path, identity in self.tree_ids.items():
+            info = path.lstat()
+            require(file_id(info)[:2] == identity, f'Directory replaced: {path}')
+        for path, identity in self.file_ids.items():
+            require(self.identity(path, root_file(path)) == identity, f'Installer file changed: {path}')
+            no_mounts(path)
+        for link, target in self.links.items():
+            root_dirs(link.parent)
+            require(link.is_symlink() and link.lstat().st_uid == 0 and link.resolve() == target,
+                    f'Service enablement link changed: {link}')
+
+
+def cleanup_menu(i, launch):
+    plan = Cleanup(i, launch, recovery=True)
+    websites = plan.websites()
+    if not (plan.trees or plan.files or plan.links or websites.containers or websites.networks or websites.volumes):
+        print('未安装面板：未找到 Harbor Panel 的安装痕迹。')
+        return False
+    print('发现以下 Harbor Panel 安装痕迹；确认后将永久删除：')
+    for path in (*plan.trees, *plan.files, *plan.links, *plan.downloads):
+        print(f'  {path}')
+    for kind, items in (('Docker 容器', websites.containers), ('Docker 网络', websites.networks),
+                        ('Docker 数据卷', websites.volumes)):
+        for name in sorted(items):
+            print(f'  {kind}: {name}')
+    try:
+        while True:
+            answer = input('先备份面板和网站数据？[Y/n，默认 Y]: ').lower()
+            if answer in ('', 'y', 'yes', 'n', 'no'):
+                break
+            print('请输入 Y 或 N。')
+        confirmed = input('确认永久卸载请输入 UNINSTALL: ') == 'UNINSTALL'
+    except EOFError:
+        confirmed = False
+    if not confirmed:
+        print('已取消。')
+        return False
+    uninstall(i, answer in ('', 'y', 'yes'), launch, plan=plan, preview=websites.signature())
+    return True
+
+
+def uninstall(i, backup, launch, *, plan=None, preview=None):
     import fcntl
 
-    i.ownership()
-    data = i.data()
-    shortcut = i.old_shortcut(data.get('shortcut'))
-    launch_download = i.download(launch)
-    downloads = [d for d in (launch_download, data.get('download')) if d]
-    if Path(launch).name == DOWNLOAD and not launch_download:
-        print('当前下载脚本未能验证归属或内容，不会自动删除。', file=sys.stderr)
-    service = Service(i)
-    files = [path for path in (*CONFIG, service.path, *((OPENRC_LOG,) if not service.systemd else ()))
-             if root_file(path, optional=True)]
-    if shortcut is not None:
-        files.append(shortcut)
-    for path in files:
-        no_mounts(path)
+    if plan is None:
+        plan = Cleanup(i, launch, recovery=False)
+    plan.verify()
+    service = plan.service
     websites = None
     destructive = False
-    worker = i.state / 'host-settings.worker.lock'
-    root_file(worker, optional=True)
-    fd = os.open(worker, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fd = None
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        host_jobs(i.state)
+        if i.state in plan.trees:
+            worker = i.state / 'host-settings.worker.lock'
+            root_file(worker, optional=True)
+            fd = os.open(worker, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            host_jobs(i.state)
         service.stop()
-        host_jobs(i.state)
-        websites = Websites(i)
+        if i.state in plan.trees:
+            host_jobs(i.state)
+        websites = plan.websites()
+        require(preview is None or websites.signature() == preview, 'Docker inventory changed after the scan')
         websites.stop()
+        plan.verify()
         if backup:
-            saved = archive_backup(i, files, websites)
+            saved = archive_backup(i, plan.files, websites, trees=plan.trees)
             print(f'备份已完成：{saved}', flush=True)
-        i.ownership()
-        fresh = Websites(i)
+        plan.verify()
+        fresh = plan.websites()
         require(fresh.signature() == websites.signature() and not any(
             work['State']['Running'] for work in fresh.containers.values()), 'Docker inventory changed during uninstall')
-        for path in files:
-            root_file(path)
-            no_mounts(path)
         destructive = True
         # Remove the exclusive proxy and WordPress listeners before deleting their state/config.
         websites.remove()
-        service.disable()
-        for path in files:
-            path.unlink()
+        if service.path is not None:
+            service.disable()
+        for link in plan.links:
+            link.unlink(missing_ok=True)
+        for path in plan.files:
+            if path != PATHS:
+                path.unlink()
         service.reload()
-        # The unit is now removed and the panel is stopped, so it cannot queue another worker.
-        os.close(fd)
-        fd = None
-        for tree in i.trees:
+        if fd is not None:
+            os.close(fd)
+            fd = None
+        for tree in plan.trees:
             no_mounts(tree)
             shutil.rmtree(tree)
-        for download in {d['path']: d for d in reversed(downloads)}.values():
+        if PATHS in plan.files:
+            PATHS.unlink()
+        for download in plan.downloads.values():
             i.remove_download(download)
     except BaseException:
         if not destructive:
@@ -739,6 +926,9 @@ def main(argv):
     elif action == 'uninstall':
         require(args[0] in {'yes', 'no'}, 'Invalid backup choice')
         uninstall(i, args[0] == 'yes', args[1])
+    elif action == 'cleanup':
+        if not cleanup_menu(i, args[0]):
+            sys.exit(3)
     else:
         raise Unsafe('Unknown menu operation')
 

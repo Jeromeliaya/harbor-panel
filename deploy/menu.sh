@@ -449,30 +449,39 @@ set_shortcut() {
     menu_admin shortcut "$shortcut" "$CALLER_PATH" "$0"
 }
 
-uninstall_panel() {
-    if [ ! -f "$APP_DIR/server.py" ]; then
-        echo "未发现已安装的 Harbor Panel。"
+uninstall_panel() (
+    # The installed helper may be missing or older than this downloaded menu.
+    helper_sha='7e04707c7c854709bd00fd8653818ca476d1d2e9e7df3f9d458aca91f201ad21'
+    helper="$APP_DIR/deploy/menu_admin.py"
+    digest_matches() {
+        actual=$(sha256sum < "$1") && [ "${actual%% *}" = "$helper_sha" ]
+    }
+    if ! command -v python3 >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
+        echo '清理需要 python3 和 sha256sum；未删除任何文件。' >&2
         return 1
     fi
-    echo "卸载将永久停止并删除面板及其已验证的 WordPress/Caddy 服务和数据，不会删除反代的外部应用。"
-    echo "专用程序、状态、工作区、审计记录、账户/凭证、环境配置和快捷命令也将删除。"
-    while :; do
-        printf '先备份面板和网站数据？[Y/n，默认 Y]: '
-        IFS= read -r backup || return 0
-        case "$backup" in
-            ''|y|Y|yes|YES) backup=yes; break ;;
-            n|N|no|NO) backup=no; break ;;
-            *) echo "请输入 Y 或 N。" ;;
-        esac
-    done
-    printf '确认永久卸载请输入 UNINSTALL: '
-    IFS= read -r answer || return 0
-    if [ "$answer" != UNINSTALL ]; then
-        echo "已取消。"
-        return 0
+    if ! { [ -f "$helper" ] && ! has_symlink_component "$helper" && safe_root_parent "$helper" &&
+           metadata=$(stat -c '%u %a %h' "$helper") && helper_safe "$metadata" && digest_matches "$helper"; }; then
+        cleanup_dir=$(mktemp -d /tmp/harbor-panel-cleanup.XXXXXXXX) || return 1
+        trap 'rm -rf -- "$cleanup_dir"' EXIT
+        trap 'exit 1' HUP INT TERM
+        helper="$cleanup_dir/menu_admin.py"
+        url='https://raw.githubusercontent.com/Jeromeliaya/harbor-panel/main/deploy/menu_admin.py'
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$helper" || return 1
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -T 30 -t 2 -O "$helper" "$url" || return 1
+        else
+            echo '缺少可用的清理组件；请安装 curl 或 wget 后重试。' >&2
+            return 1
+        fi
+        if ! digest_matches "$helper"; then
+            echo '清理组件版本不匹配；请重新下载最新版菜单后重试。未删除任何文件。' >&2
+            return 1
+        fi
     fi
-    menu_admin uninstall "$backup" "$0"
-}
+    python3 -I "$helper" cleanup "$APP_DIR" "$STATE_DIR" "$0"
+)
 
 while :; do
     printf '\nHarbor Panel 管理菜单\n'
@@ -481,7 +490,7 @@ while :; do
     case "$choice" in
         1) install_panel ;;
         2) update_panel ;;
-        3) if uninstall_panel && [ ! -f "$APP_DIR/server.py" ]; then exit 0; fi ;;
+        3) if uninstall_panel; then exit 0; fi ;;
         5) set_shortcut || : ;;
         0) exit 0 ;;
         *) echo "无效选项，请输入 1、2、3、5 或 0。" ;;
