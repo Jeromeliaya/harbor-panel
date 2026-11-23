@@ -138,7 +138,7 @@ safe_root_parent() {
 }
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "请使用 root 运行。直接下载运行时可执行: sudo curl -fsSL URL -o /root/harbor-panel-menu.sh && sudo sh /root/harbor-panel-menu.sh" >&2
+    echo '请先以 root 登录，或运行 sudo -i，再到仅 root 可写的目录按 README 下载并执行 ./harbor-panel-menu.sh。' >&2
     exit 1
 fi
 if has_symlink_component "$APP_DIR" || has_symlink_component "$STATE_DIR"; then

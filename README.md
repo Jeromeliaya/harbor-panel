@@ -131,10 +131,13 @@ docker compose down
 
 也可以直接通过 `curl` 打开交互式管理菜单。菜单提供安装、更新、卸载、快捷命令设置和退出；源码从本仓库下载，更新不会删除工作区、审计数据库或密码配置：
 
+在 VPS 上以 `root` 登录（普通用户先运行 `sudo -i`），在仅 root 可写的目录（例如 root 的家目录）执行：
+
 ```sh
-sudo curl -fsSL https://raw.githubusercontent.com/Jeromeliaya/harbor-panel/main/deploy/menu.sh -o /root/harbor-panel-menu.sh
-sudo sh /root/harbor-panel-menu.sh
+curl -fsSL https://raw.githubusercontent.com/Jeromeliaya/harbor-panel/main/deploy/menu.sh -o harbor-panel-menu.sh && chmod +x harbor-panel-menu.sh && ./harbor-panel-menu.sh
 ```
+
+脚本下载到当前目录。以后在同一目录输入 `./harbor-panel-menu.sh` 即可打开菜单。保留此文件名，卸载时才能自动清理通过归属验证的下载脚本。
 
 菜单选项：`1` 安装、`2` 更新、`3` 卸载、`5` 设置面板快捷、`0` 退出。安装默认端口 `8088`，可输入 `0–65535`（`0` 为临时端口，不用于固定部署）。更新沿用 `/etc/harbor-panel.port` 和 `/etc/harbor-panel.paths`，保留账户和数据。快捷命令支持中英文、数字及 `_ . + -`；不能包含空格或 Shell 操作符，也不能覆盖已有命令。示例：设置 `港口` 后输入 `港口` 即可重新打开菜单。
 
