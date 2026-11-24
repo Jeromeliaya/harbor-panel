@@ -6,6 +6,7 @@ from pathlib import Path
 import socket
 import stat
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -143,6 +144,17 @@ class ListenerJobs(unittest.TestCase):
     def mutations(self):
         return [event for event in self.host.events if event[0] == "write" and event[1] in
                 (hs.PORT_FILE, hs.NGINX_FILE, hs.SSH_FILE)]
+
+    def test_http_managed_domain_updates_upstream_without_exposing_new_port(self):
+        self.host.origin = "http://panel.example.test"
+        with mock.patch.object(hs.HostSettings, "_proxy_origin", return_value=self.host.origin):
+            manager = self.settings()
+            self.assertEqual(manager.status()["panel"]["mode"], "http_proxy")
+            job = manager.start("panel", 9090)
+            self.worker(job["id"])
+            self.assertEqual(manager.job(job["id"])["status"], "succeeded")
+        self.assertEqual(self.host.files[hs.NGINX_FILE], hs._nginx_file(9090))
+        self.assertEqual(self.host.proxy, 9090)
 
     def test_direct_noop_and_occupied_port_do_not_launch_or_write(self):
         manager = self.settings()
@@ -303,6 +315,38 @@ class ListenerJobs(unittest.TestCase):
 
 
 class HostValidation(unittest.TestCase):
+    def test_ssh_bootstrap_preserves_non_port_settings_and_restores_failed_adoption(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config, include = Path(folder) / "sshd_config", Path(folder) / "panel-ports.conf"
+            original = "Port 22\nPasswordAuthentication no\nMatch User backup\n    X11Forwarding no\n"
+            config.write_text(original)
+            ops = hs.HostOperations()
+            output = "port 22\nlistenaddress 0.0.0.0:22\npasswordauthentication no\n"
+            with mock.patch.object(hs, "SSH_CONFIG", config), mock.patch.object(hs, "SSH_FILE", include), \
+                    mock.patch.object(hs, "_read_file", side_effect=lambda p: p.read_text()), \
+                    mock.patch.object(hs, "_atomic_write", side_effect=lambda p, text: p.write_text(text)), \
+                    mock.patch.object(hs, "_open_file", side_effect=lambda p, flags: os.open(p, flags)), \
+                    mock.patch.object(hs, "_sync_dir"), \
+                    mock.patch.object(ops, "command", return_value=SimpleNamespace(stdout=output)):
+                self.assertEqual(ops.ssh_bootstrap(apply=False)[0], 22)
+                self.assertFalse(include.exists())
+                self.assertEqual(config.read_text(), original)
+                ops.ssh_bootstrap(apply=True)
+                self.assertEqual(include.read_text(), "Port 22\n")
+                self.assertTrue(config.read_text().startswith(f"Include {include}\n# Harbor Panel adopted: Port 22\n"))
+                self.assertIn("Match User backup\n    X11Forwarding no", config.read_text())
+                config.write_text(original)
+                include.unlink()
+                with mock.patch.object(ops, "ssh_config", return_value=(["0.0.0.0"], "changed")):
+                    with self.assertRaisesRegex(PanelError, "beyond"):
+                        ops.ssh_bootstrap(apply=True)
+                self.assertEqual(config.read_text(), original)
+                self.assertFalse(include.exists())
+                include.write_text("Port 22\n")
+                ops.ssh_bootstrap(apply=True)
+                self.assertTrue(config.read_text().startswith(f"Include {include}\n"))
+                self.assertEqual(include.read_text(), "Port 22\n")
+
     def test_https_rejects_any_nonlocal_dns_answer_before_opening_sockets(self):
         local = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.10", 443))
         remote = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.51.100.10", 443))

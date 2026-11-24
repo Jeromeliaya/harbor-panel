@@ -254,7 +254,7 @@ class HostOperations:
             raise _error(f"Bootstrap {NGINX_FILE} with only: {_nginx_file(port).strip()}")
         result = self.command("nginx", "-T")
         if f"# configuration file {NGINX_FILE}:" not in result.stdout.splitlines():
-            raise _error(f"The live Nginx configuration must include {NGINX_FILE} in the HTTPS panel location.")
+            raise _error(f"The live Nginx configuration must include {NGINX_FILE} in the panel location.")
 
     def reload_nginx(self):
         self.command("nginx", "-t")
@@ -263,9 +263,12 @@ class HostOperations:
     def probe_panel(self, base, nonce, proof):
         verified = threading.Event()
 
-        def request(connection):
+        def request(connection, host=None):
             try:
-                connection.request("GET", f"{HEALTH_PATH}?nonce={nonce}", headers={"Cache-Control": "no-cache"})
+                headers = {"Cache-Control": "no-cache"}
+                if host:
+                    headers["Host"] = host
+                connection.request("GET", f"{HEALTH_PATH}?nonce={nonce}", headers=headers)
                 with connection.getresponse() as response:
                     return response.status == 200 and json.loads(response.read(256)) == {"proof": proof}
             finally:
@@ -283,6 +286,9 @@ class HostOperations:
                         verified.set()
                 elif origin.scheme == "http" and origin.hostname == "127.0.0.1" and origin.port:
                     if request(HTTPConnection("127.0.0.1", origin.port, timeout=2)):
+                        verified.set()
+                elif origin.scheme == "http" and origin.hostname and origin.port in (None, 80):
+                    if request(HTTPConnection("127.0.0.1", 80, timeout=2), origin.hostname):
                         verified.set()
             except (OSError, ValueError, HTTPException, PanelError, psutil.Error):
                 pass
@@ -331,7 +337,11 @@ class HostOperations:
                 break
             global_lines.append(line)
         if not any(re.fullmatch(rf"(?i:include)\s+{re.escape(str(SSH_FILE))}", line) for line in global_lines):
-            raise _error(f"Add a global Include {SSH_FILE} to OpenSSH before any Match blocks.")
+            raise PanelError(f"Add a global Include {SSH_FILE} to OpenSSH before any Match blocks.",
+                             409, code="ssh_include_missing")
+        return self._ssh_effective(ports)
+
+    def _ssh_effective(self, ports):
         self.command("sshd", "-t", "-f", str(SSH_CONFIG))
         result = self.command("sshd", "-T", "-f", str(SSH_CONFIG))
         effective = set()
@@ -355,6 +365,52 @@ class HostOperations:
             raise _error("Only ports from the managed OpenSSH include and standard wildcard listeners are supported.")
         digest = hashlib.sha256("\n".join(sorted(other)).encode("utf-8")).hexdigest()
         return sorted(hosts), digest
+
+    def ssh_bootstrap(self, *, apply=False):
+        original = _read_file(SSH_CONFIG)
+        result = self.command("sshd", "-T", "-f", str(SSH_CONFIG))
+        ports = re.findall(r"(?m)^port (\d+)$", result.stdout)
+        if len(ports) != 1:
+            raise _error("Automatic SSH setup requires a single current OpenSSH port.")
+        old = _port(int(ports[0]))
+        baseline = self._ssh_effective([old])
+        try:
+            existing = _read_file(SSH_FILE)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and existing != _ssh_file(old):
+            raise _error("The existing SSH port snippet differs from the current listener.")
+        if not apply:
+            return old, baseline
+        candidate = [f"Include {SSH_FILE}"]
+        global_section = True
+        for line in original.splitlines():
+            directive = line.partition("#")[0].strip()
+            if re.match(r"(?i:match)(?:\s|=)", directive):
+                global_section = False
+            if global_section and re.fullmatch(rf"(?i:include)\s+{re.escape(str(SSH_FILE))}", directive):
+                continue
+            if global_section and re.match(r"(?i:port)(?:\s|=)", directive):
+                line = "# Harbor Panel adopted: " + line
+            candidate.append(line)
+        text = "\n".join(candidate) + "\n"
+        if existing is None:
+            with os.fdopen(_open_file(SSH_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL), "w") as handle:
+                handle.write(_ssh_file(old))
+                handle.flush()
+                os.fsync(handle.fileno())
+            _sync_dir(SSH_FILE.parent)
+        try:
+            _swap(SSH_CONFIG, original, text)
+            if self.ssh_config([old]) != baseline:
+                raise _error("Automatic SSH setup changed settings beyond the listener port.")
+        except BaseException:
+            _swap(SSH_CONFIG, text, original)
+            if existing is None:
+                SSH_FILE.unlink(missing_ok=True)
+                _sync_dir(SSH_FILE.parent)
+            raise
+        return old, baseline
 
     def ssh_listening(self, unit, ports, hosts):
         info = self.unit(unit, "MainPID", "ActiveState")
@@ -388,6 +444,13 @@ class HostSettings:
 
     def _supported(self):
         return self.full_host and self.ops.available()
+
+    def _proxy_origin(self):
+        if self.public_origin:
+            return self.public_origin.rstrip("/")
+        from panel_proxy import PanelProxy
+        site = PanelProxy(self.state, self.panel_port, enabled=self.full_host).site
+        return f"http://{site['domain']}" if site and site["enabled"] else None
 
     def _require(self):
         if not self._supported():
@@ -455,7 +518,7 @@ class HostSettings:
         if not _matches(env, _panel_file(old_port)):
             raise _error(f"Bootstrap {PORT_FILE} with only HARBOR_PANEL_PORT={old_port}.")
         files = {"panel": env}
-        if self.public_origin:
+        if self._proxy_origin():
             try:
                 snippet = _read_file(NGINX_FILE)
             except FileNotFoundError as exc:
@@ -464,17 +527,27 @@ class HostSettings:
             files["nginx"] = snippet
         return files
 
-    def _preflight_ssh(self):
+    def _preflight_ssh(self, *, prepare=False):
         unit = self.ops.ssh_unit()
         try:
             text = _read_file(SSH_FILE)
-        except FileNotFoundError as exc:
-            raise _error(f"Bootstrap {SSH_FILE} and include it from the global sshd_config.") from exc
+        except FileNotFoundError:
+            old, (hosts, baseline) = self.ops.ssh_bootstrap(apply=prepare)
+            if not self.ops.ssh_listening(unit, [old], hosts):
+                raise _error("The current OpenSSH listener could not be verified.")
+            return old, unit, _ssh_file(old), hosts, baseline
         match = re.fullmatch(r"Port ([0-9]{1,5})\n?", text)
         if not match:
             raise _error(f"Bootstrap {SSH_FILE} with only Port <current-port>.")
         old = _port(int(match[1]))
-        hosts, baseline = self.ops.ssh_config([old])
+        try:
+            hosts, baseline = self.ops.ssh_config([old])
+        except PanelError as exc:
+            if exc.code != "ssh_include_missing":
+                raise
+            adopted, (hosts, baseline) = self.ops.ssh_bootstrap(apply=prepare)
+            if adopted != old:
+                raise _error("The existing SSH snippet differs from the current listener.")
         if not self.ops.ssh_listening(unit, [old], hosts):
             raise _error("The current OpenSSH listener could not be verified.")
         return old, unit, text, hosts, baseline
@@ -489,8 +562,10 @@ class HostSettings:
         return "Listener management failed; inspect the service journal."
 
     def status(self):
-        mode = "https_proxy" if self.public_origin else "direct"
-        panel = {"port": self.panel_port, "mode": mode, "public_origin": self.public_origin, "available": False, "reason": None}
+        proxy_origin = self._proxy_origin()
+        mode = "https_proxy" if self.public_origin else ("http_proxy" if proxy_origin else "direct")
+        panel = {"port": self.panel_port, "mode": mode, "public_origin": self.public_origin,
+                 "proxy_origin": proxy_origin, "available": False, "reason": None}
         ssh = {"ports": [], "available": False, "reason": None}
         if not self._supported():
             for item in (panel, ssh):
@@ -534,7 +609,8 @@ class HostSettings:
                     raise _error("Previous rollback failed; recover from the VPS console first.")
                 if jobs and jobs[-1]["status"] in ACTIVE:
                     raise PanelError("A listener change is already in progress.", 409, code="listener_busy")
-                mode = "ssh" if kind == "ssh" else ("https_proxy" if self.public_origin else "direct")
+                mode = "ssh" if kind == "ssh" else ("https_proxy" if self.public_origin else
+                                                  ("http_proxy" if self._proxy_origin() else "direct"))
                 if kind == "panel":
                     old = self.panel_port
                     if old != port:
@@ -548,7 +624,7 @@ class HostSettings:
                 if old == port:
                     job.update(status="succeeded", message=f"TCP port {port} is already configured; nothing changed.")
                 else:
-                    if mode != "https_proxy" and firewall_ready is not True:
+                    if mode not in ("https_proxy", "http_proxy") and firewall_ready is not True:
                         raise PanelError("Open the new TCP port in the cloud security group and host firewall first.",
                                          code="firewall_confirmation_required")
                     self.ops.free_port(port)
@@ -624,7 +700,7 @@ class HostSettings:
     def _switch_panel(self, job):
         job_id, old, port = job["id"], job["old_port"], job["port"]
         files = self._preflight_panel(old)
-        origin = self.public_origin.rstrip("/") if self.public_origin else None
+        origin = self._proxy_origin()
         probe = self._probe(job, old)
         self._verify_panel(f"http://127.0.0.1:{old}", probe, "Could not verify the current local panel listener.")
         if origin:
@@ -642,12 +718,12 @@ class HostSettings:
             self.ops.https_proxy(port, _nginx_file(port))
             self.ops.reload_nginx()
             self._verify_panel(origin, probe, "The HTTPS origin did not reach the new local panel listener.")
-            return f"Panel now listens on TCP {port}. Your public HTTPS address is unchanged."
+            return f"Panel now listens on TCP {port}. Your public domain address is unchanged."
         return f"Panel now listens on TCP {port}. Use the new port; cloud and host firewall access was not verified."
 
     def _switch_ssh(self, job):
         job_id, old, port = job["id"], job["old_port"], job["port"]
-        current, unit, text, hosts, baseline = self._preflight_ssh()
+        current, unit, text, hosts, baseline = self._preflight_ssh(prepare=True)
         if current != old:
             raise _error("The live OpenSSH port changed while the job was queued.")
         self.ops.free_port(port)
@@ -699,8 +775,8 @@ class HostSettings:
             probe = self._probe(job, old)
             self.ops.command("systemctl", "restart", PANEL_UNIT)
             self._verify_panel(f"http://127.0.0.1:{old}", probe, "The old local panel listener was not verified.")
-            if self.public_origin:
-                self._verify_panel(self.public_origin.rstrip("/"), probe, "The old HTTPS proxy route was not verified.")
+            if self._proxy_origin():
+                self._verify_panel(self._proxy_origin(), probe, "The old proxy route was not verified.")
         except (OSError, PanelError, ValueError) as exc:
             errors.append(self._reason(exc))
         if errors:

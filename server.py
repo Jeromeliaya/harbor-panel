@@ -25,7 +25,7 @@ from host import Host
 from appearance import AppearanceStore
 from terminal import TerminalManager
 from sites import SiteManager
-from host_settings import HEALTH_PATH, HostSettings
+from host_settings import HEALTH_PATH, HostOperations, HostSettings
 from mfa import MFA, webauthn_user_handle
 
 
@@ -102,15 +102,15 @@ class Auth:
         return token, csrf
 
     @staticmethod
-    def _require_mfa_https(origin):
+    def _require_mfa_origin(origin):
         if not origin:
-            raise PanelError("Second factors require the configured HTTPS panel address and trusted TLS proxy.", 403)
+            raise PanelError("Second factors require a verified same-origin panel address.", 403)
 
     def _verification_start(self, purpose, owner, origin, rp_id, *, scope="mfa"):
-        self._require_mfa_https(origin)
+        self._require_mfa_origin(origin)
         methods = self.mfa.status(rp_id)["methods"]
         if not methods:
-            raise PanelError("No enrolled second factor is usable at this HTTPS address. Contact the host administrator.", 403)
+            raise PanelError("No enrolled second factor is usable here. Use the Passkey enrollment address or a configured authenticator.", 403)
         return {"challenge": self.mfa.begin(purpose, owner, origin, scope=scope), "methods": methods}
 
     def login(self, username, password, address, origin=None, rp_id=None):
@@ -121,7 +121,7 @@ class Auth:
             return self._issue_session()
 
     def mfa_login(self, action, address, origin, rp_id, body):
-        self._require_mfa_https(origin)
+        self._require_mfa_origin(origin)
         with self.lock:
             challenge = body.get("challenge")
             if action == "options":
@@ -137,7 +137,7 @@ class Auth:
             return {**status, "available": bool(origin and self.username), "passkey_available": bool(origin and rp_id and self.username)}
 
     def mfa_settings(self, action, token, address, origin, rp_id, body):
-        self._require_mfa_https(origin)
+        self._require_mfa_origin(origin)
         if action == "reauth":
             self._check_password(address, None, body.get("password"), reauth=True)
         with self.lock:
@@ -172,7 +172,7 @@ class Auth:
             return {"signed_out": True}, revoked
 
     def authorize_listener_change(self, token, address, origin, body):
-        if origin:
+        if origin and ("password" not in body or body.get("grant")):
             with self.lock:
                 self.session(token)
                 self.mfa.take_grant(body.get("grant"), token, origin, "listener")
@@ -180,7 +180,7 @@ class Auth:
         with self.lock:
             self.session(token)
             if self.mfa.enabled():
-                raise PanelError("Use the configured HTTPS address to verify this change.", 403)
+                raise PanelError("Verify the enrolled second factor before changing listeners.", 403)
             self._check_password(address, None, body.get("password"), reauth=True)
 
     def setup_required(self):
@@ -308,14 +308,34 @@ class PanelServer(ThreadingHTTPServer):
             self.secure_cookie = True
         self.allowed_hosts = {urlsplit(origin).netloc.lower() for origin in self.origins}
         try:
+            from panel_proxy import PanelProxy
+            self.panel_http_domain = None
+            self.panel_proxy = PanelProxy(state, port, self.full_host_root and not self.public_origin and HostOperations().available(),
+                                          changed=self._panel_domain_changed)
+            self._panel_domain_changed()
             self.sites = SiteManager(state, self.full_host_root, self.audit, port,
-                                     {urlsplit(origin).hostname for origin in self.origins}, self.secure_cookie)
+                                     {urlsplit(origin).hostname for origin in self.origins}, self.secure_cookie,
+                                     panel_proxy=self.panel_proxy)
             self.host = Host(self.files.root, full_host=full_host)
             self.host_settings = HostSettings(state, full_host=self.full_host_root, panel_port=port,
                                               public_origin=self.public_origin, panel_host=self.server_address[0])
         except Exception:
             self.server_close()
             raise
+
+    def _panel_domain_changed(self):
+        if self.panel_http_domain:
+            self.allowed_hosts.discard(self.panel_http_domain)
+            self.origins.discard(f"http://{self.panel_http_domain}")
+            if hasattr(self, "sites"):
+                self.sites.panel_hosts.discard(self.panel_http_domain)
+        site = self.panel_proxy.site
+        self.panel_http_domain = site["domain"] if site and site["enabled"] else None
+        if self.panel_http_domain:
+            self.allowed_hosts.add(self.panel_http_domain)
+            self.origins.add(f"http://{self.panel_http_domain}")
+            if hasattr(self, "sites"):
+                self.sites.panel_hosts.add(self.panel_http_domain)
 
     def server_close(self):
         if hasattr(self, "terminal"):
@@ -428,6 +448,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _mfa_origin(self, mutation):
         origin = self.server.public_origin
+        if not origin:
+            host = self.headers.get("Host", "").lower()
+            origin = f"http://{host}"
+            if mutation and self.headers.get_all("Origin") != [origin]:
+                return None
+            return origin
         if not origin or self.headers.get("Host", "").lower() not in self.server.allowed_hosts:
             return None
         if mutation and self.headers.get_all("Origin") != [origin]:
@@ -436,6 +462,14 @@ class Handler(BaseHTTPRequestHandler):
         if not ipaddress.ip_address(self.client_address[0]).is_loopback:
             return None
         return origin if self.headers.get_all("X-Forwarded-Proto") == ["https"] else None
+
+    def _rp_id(self, origin):
+        if not origin:
+            return None
+        parsed = urlsplit(origin)
+        if parsed.scheme == "http":
+            return "localhost" if parsed.hostname == "localhost" else None
+        return self.server.rp_id
 
     def _respond_login(self, result, address):
         previous_token = self._token()
@@ -489,8 +523,15 @@ class Handler(BaseHTTPRequestHandler):
             address = self.client_address[0]
             if path == HEALTH_PATH and self.command == "GET":
                 nonce = query.get("nonce", [])
-                allowed_probe = local_health or (self._mfa_origin(False) if self.server.public_origin else False)
-                proof = self.server.host_settings.health(nonce[0]) if allowed_probe and len(nonce) == 1 else None
+                managed_probe = (host == self.server.panel_http_domain
+                                 and ipaddress.ip_address(self.client_address[0]).is_loopback)
+                allowed_probe = (local_health or (self._mfa_origin(False) if self.server.public_origin else False)
+                                 or managed_probe)
+                pending = self.server.panel_proxy.probe
+                if managed_probe and pending and len(nonce) == 1 and hmac.compare_digest(nonce[0], pending["nonce"]):
+                    proof = {"proof": pending["proof"]}
+                else:
+                    proof = self.server.host_settings.health(nonce[0]) if allowed_probe and len(nonce) == 1 else None
                 self._respond(200 if proof else 404, proof or {"error": "Not found."})
                 return
             if path == "/api/setup" and self.command == "GET":
@@ -501,9 +542,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._body()
                 try:
                     if path == "/api/login":
-                        result = self.server.auth.login(body.get("username"), body.get("password"), address, mfa_origin, self.server.rp_id)
+                        result = self.server.auth.login(body.get("username"), body.get("password"), address, mfa_origin, self._rp_id(mfa_origin))
                     else:
-                        result = self.server.auth.mfa_login(path.rsplit("/", 1)[1], address, mfa_origin, self.server.rp_id, body)
+                        result = self.server.auth.mfa_login(path.rsplit("/", 1)[1], address, mfa_origin, self._rp_id(mfa_origin), body)
                 except PanelError:
                     if not path.endswith("/options"):
                         self.server.audit.add("login", "administrator", address, False)
@@ -527,11 +568,11 @@ class Handler(BaseHTTPRequestHandler):
                 token = self._token()
                 session = self.server.auth.session(token)
                 if session["mfa"]:
-                    self.server.auth._require_mfa_https(mfa_origin)
+                    self.server.auth._require_mfa_origin(mfa_origin)
                 if mutation and not hmac.compare_digest(self.headers.get("X-CSRF-Token", "").encode("utf-8"), session["csrf"].encode("ascii")):
                     raise PanelError("CSRF token is missing or invalid.", 403)
                 if path == "/api/mfa" and self.command == "GET":
-                    self._respond(200, self.server.auth.mfa_status(token, mfa_origin, self.server.rp_id))
+                    self._respond(200, self.server.auth.mfa_status(token, mfa_origin, self._rp_id(mfa_origin)))
                     return
                 if path.startswith("/api/mfa/") and self.command == "POST":
                     self._write_mfa(path.removeprefix("/api/mfa/"), token, address, mfa_origin)
@@ -578,7 +619,7 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         audit_action = "mfa." + action.replace("/", ".")
         try:
-            result, revoked = self.server.auth.mfa_settings(action, token, address, origin, self.server.rp_id, body)
+            result, revoked = self.server.auth.mfa_settings(action, token, address, origin, self._rp_id(origin), body)
         except PanelError:
             self.server.audit.add(audit_action, "administrator", address, False)
             raise

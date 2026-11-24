@@ -53,8 +53,8 @@ window.HarborHostSettings = (() => {
         link.hash = "settings";
         children.push(node("p", "端口切换可能中断当前页面。若原地址断开，稍后打开新端口并重新登录；若已回滚，请使用旧端口。"), node("a", "在新标签打开新端口", { href: link.href, target: "_blank", rel: "noopener noreferrer" }));
       }
-      if (job?.kind === "panel" && job.mode === "https_proxy" && active(job)) {
-        children.push(node("p", "代理切换时可能短暂断开。请保留当前 HTTPS 域名，恢复后重新登录。"));
+      if (job?.kind === "panel" && ["https_proxy", "http_proxy"].includes(job.mode) && active(job)) {
+        children.push(node("p", "代理切换时可能短暂断开。请保留当前域名，恢复后重新登录。"));
       }
       if (job?.status === "awaiting_confirmation") {
         const date = new Date(job.confirmation_deadline * 1000).toLocaleTimeString("zh-CN", { hour12: false });
@@ -73,11 +73,11 @@ window.HarborHostSettings = (() => {
       stage.replaceChildren(...["ssh", "panel"].map((kind) => {
         const info = snapshot[kind];
         const ssh = kind === "ssh";
-        const proxy = info.mode === "https_proxy";
+        const proxy = ["https_proxy", "http_proxy"].includes(info.mode);
         const section = node("section", "", { class: "panel settings-card" });
         section.append(node("h2", ssh ? "系统 SSH 端口" : "面板端口"),
           node("p", `当前端口：${ssh ? info.ports.join(" / ") || "未能读取" : info.port}`),
-          node("p", ssh ? "只修改外部 OpenSSH，不影响面板自带终端。" : proxy ? `变更通过 Nginx 同步更新，公网地址保持 ${info.public_origin}。` : "修改后请用新端口访问；建议先配置 HTTPS。", { class: "muted" }));
+          node("p", ssh ? "只修改外部 OpenSSH，不影响面板自带终端。IP:端口或域名访问均可操作。" : proxy ? `变更通过 Nginx 同步更新，域名地址保持 ${info.proxy_origin || info.public_origin}。` : "修改后请用新端口访问；建议先配置 HTTPS。", { class: "muted" }));
         if (!info.available) section.append(node("p", info.reason || "暂不可修改。", { class: "muted" }));
         if (!info.available || busy) return section;
         const form = node("form", "", { class: "stack" });
@@ -148,7 +148,6 @@ window.HarborHostSettings = (() => {
         submit.disabled = cancel.disabled = true;
         error.textContent = "";
         try {
-          if (!snapshot.panel.public_origin) return await apply({ password: value });
           const flow = await post("mfa/reauth", { password: value, scope: "listener" });
           if (signal.aborted) return;
           if (flow.grant) return await apply({ grant: flow.grant });

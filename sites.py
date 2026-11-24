@@ -128,7 +128,7 @@ class SiteManager:
     MAX_SCAN = 200
     ADMIN = "site-admin"
 
-    def __init__(self, state, enabled, audit, panel_port, panel_hosts, secure=False):
+    def __init__(self, state, enabled, audit, panel_port, panel_hosts, secure=False, panel_proxy=None):
         self.directory = Path(state) / "websites"
         self.config_dir = self.directory / "proxy"
         self.config = self.config_dir / "Caddyfile"
@@ -138,6 +138,7 @@ class SiteManager:
         self.panel_port = panel_port
         self.panel_hosts = set(panel_hosts)
         self.secure = secure
+        self.panel_proxy = panel_proxy
         self.lock = threading.Lock()
         self.job = None
         self.credentials_expire = 0
@@ -151,7 +152,8 @@ class SiteManager:
 
     def overview(self):
         with self.lock:
-            return {"sites": [self._public(site) for site in self.sites], "supported": self.supported,
+            panel = self.panel_proxy.public() if self.panel_proxy else None
+            return {"sites": [self._public(site) for site in self.sites] + ([panel] if panel else []), "supported": self.supported,
                     "job": self._job(False)}
 
     @staticmethod
@@ -385,7 +387,10 @@ class SiteManager:
                 elif port not in excluded and "%" not in host:
                     rows[host, port] = project
         ordered = sorted(rows.items(), key=lambda item: (item[0][1], item[0][0]))
-        return {"services": [{"port": port, "address": host, "project": project, "upstream": authority(host, port)}
+        panel = {"port": self.panel_port, "address": "127.0.0.1", "project": "Harbor Panel · Nginx 域名入口",
+                 "upstream": f"127.0.0.1:{self.panel_port}", "panel": True}
+        return {"services": ([panel] if self.panel_proxy and self.panel_proxy.enabled else []) +
+                            [{"port": port, "address": host, "project": project, "upstream": authority(host, port)}
                              for (host, port), project in ordered[:self.MAX_SCAN]],
                 "panel_port": self.panel_port, "truncated": len(ordered) > self.MAX_SCAN}
 
@@ -478,6 +483,13 @@ class SiteManager:
         if kind not in ("wordpress", "proxy", "https"):
             raise PanelError("请选择有效的站点服务。")
         upstream = None if kind == "wordpress" else parse_upstream(upstream, kind)
+        if (kind == "proxy" and upstream.scheme == "http" and upstream.port == self.panel_port
+                and upstream.host in ("127.0.0.1", "::1", "localhost")):
+            if not self.panel_proxy or not self.panel_proxy.enabled or self.secure:
+                raise PanelError("面板 Nginx 入口需要尚未配置 HTTPS 的原生 root systemd 部署。", 409)
+            if any(site["domain"] == domain for site in self.sites):
+                raise PanelError("此主域名已存在。", 409)
+            return self._submit("panel-proxy", domain, address, self.panel_proxy.create, domain)
         if upstream and (upstream.host == domain or (upstream.host in self.panel_hosts and
                          upstream.port in (80, 443, self.panel_port))):
             raise PanelError("上游不能是当前主域名或 Harbor Panel 本身。")
@@ -486,6 +498,8 @@ class SiteManager:
     def action(self, site_id, action, address):
         if not isinstance(site_id, str) or not SITE_ID.fullmatch(site_id) or action not in ("enable", "disable", "remove"):
             raise PanelError("无效的网站或操作。")
+        if self.panel_proxy and self.panel_proxy.site and self.panel_proxy.site["id"] == site_id:
+            return self._submit(action, site_id, address, self.panel_proxy.action, action)
         return self._submit(action, site_id, address, self._action, site_id, action)
 
     @staticmethod

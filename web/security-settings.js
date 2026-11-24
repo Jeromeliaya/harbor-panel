@@ -105,7 +105,7 @@ window.HarborSecuritySettings = (() => {
         };
         preparePasskey();
       } else {
-        form.append(el("p", "此浏览器无法使用 Passkey。请换用受支持的浏览器。", { class: "muted" }));
+        form.append(el("p", "Passkey 需要安全上下文：HTTPS 域名或通过 SSH 隧道访问的 http://localhost。公网 IP 的 HTTP 页面受浏览器限制，无法使用。", { class: "muted" }));
       }
     }
     async function verify(act) {
@@ -150,7 +150,8 @@ window.HarborSecuritySettings = (() => {
       if (signal.aborted) return;
       error.textContent = message;
       const content = [el("p", status.totp ? "Google Authenticator：已启用" : "Google Authenticator：未启用")];
-      if (!status.available) content.push(el("p", "管理第二重验证需要通过配置的 HTTPS 面板地址访问，并由受信任的本机代理转发。", { class: "muted" }));
+      if (!status.available) content.push(el("p", "请使用已验证的面板地址和已注册的管理员账户管理第二重验证。", { class: "muted" }));
+      if (status.available && location.protocol === "http:") content.push(el("p", "HTTP 不加密密码和验证密钥，请在可信网络或 SSH 隧道中设置。", { class: "muted" }));
       function action(text, callback) {
         const control = button(text);
         control.onclick = callback;
@@ -168,7 +169,7 @@ window.HarborSecuritySettings = (() => {
       if (status.passkey_available && credentialSupported() && status.passkeys.length < 10) {
         action("添加 Passkey", () => reauth("enroll", "passkey"));
       } else if (status.available && !status.passkeys.length) {
-        content.push(el("p", "Passkey 需要 HTTPS 域名和受支持的浏览器。", { class: "muted" }));
+        content.push(el("p", "Passkey 支持 HTTPS 域名或 http://localhost（可通过 SSH 隧道访问）。公网 IP 的 HTTP 页面无法调用浏览器 Passkey；可使用 Google Authenticator。", { class: "muted" }));
       }
       content.push(el("p", "更改验证方式会退出所有登录会话。请妥善保管设备；失去所有验证方式时，请联系主机管理员。", { class: "muted" }), error);
       stage.replaceChildren(...content);

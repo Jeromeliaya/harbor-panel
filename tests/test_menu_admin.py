@@ -292,7 +292,39 @@ class TestMenuAdmin(unittest.TestCase):
         discover.assert_called_once_with(i, recovery=True)
         self.assertEqual(remove.call_args.kwargs['preview'], w.signature())
         self.assertIn(WP, log.getvalue())
-        self.assertNotIn('?????', log.getvalue())
+        self.assertNotIn('未安装面板', log.getvalue())
+
+    def test_owned_nginx_entry_is_detached_but_unverified_edits_are_preserved(self):
+        root, i = self.installation_fixture()
+        config, upstream = root / 'nginx.conf', root / 'upstream.conf'
+        content = b'# Harbor Panel managed HTTP entry\nserver { listen 80; }\n'
+        config.write_bytes(content)
+        upstream.write_bytes(b'proxy_pass http://127.0.0.1:8088;\n')
+        record = i.state / 'panel-domain.json'
+        record.write_text(json.dumps({'id': SITE, 'enabled': True,
+                                     'config_sha256': hashlib.sha256(content).hexdigest()}))
+        with self.recovery_fixture(root, i), patch.object(admin, 'NGINX_ENTRY', config), \
+                patch.object(admin, 'NGINX_UPSTREAM', upstream), \
+                patch.object(admin, 'executable', side_effect=lambda name: name), \
+                patch.object(admin, 'run', return_value=SimpleNamespace(stdout='', returncode=0)) as command:
+            entry = admin.PanelEntry(i)
+            self.assertEqual(entry.files, [config, upstream])
+            config.write_bytes(b'manual edit')
+            with self.assertRaisesRegex(admin.Unsafe, 'changed'):
+                admin.PanelEntry(i)
+            self.assertEqual(config.read_bytes(), b'manual edit')
+            config.write_bytes(content)
+            with patch.object(admin, 'run', return_value=SimpleNamespace(
+                    stdout=f'# configuration file {upstream}:\n', returncode=0)), \
+                    patch.object(admin, 'write_exclusive', side_effect=lambda p, data: p.write_bytes(data)):
+                with self.assertRaisesRegex(admin.Unsafe, 'Another Nginx site'):
+                    entry.detach()
+            self.assertEqual(config.read_bytes(), content)
+            self.assertTrue(upstream.exists())
+            entry.detach()
+            self.assertFalse(config.exists())
+            self.assertTrue(upstream.exists())
+            command.assert_any_call(['systemctl', 'reload', 'nginx.service'])
 
     def test_option_three_refuses_unknown_or_replaced_state(self):
         root, i = self.installation_fixture()

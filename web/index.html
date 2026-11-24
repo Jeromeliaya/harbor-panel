@@ -71,7 +71,7 @@
         <div class="site-field">
           <label for="site-domain">1. 主域名</label>
           <input id="site-domain" required maxlength="253" placeholder="www.example.com" spellcheck="false" autocapitalize="off" aria-describedby="site-domain-help">
-          <p id="site-domain-help" class="muted">将域名的 A / AAAA 记录指向本机对应的公网 IPv4 / IPv6 地址。请确保公网可以访问 TCP 80 和 443。</p>
+          <p id="site-domain-help" class="muted">将域名的 A / AAAA 记录指向本机公网 IP。面板 Nginx HTTP 入口需放行 TCP 80；普通 HTTPS 站点需放行 TCP 80 和 443。</p>
         </div>
         <fieldset id="site-kind-options" class="site-field">
           <legend>2. 站点服务</legend>
@@ -89,13 +89,13 @@
           <p id="site-exposure-warning" class="site-warning">反代可能将本机或内网服务暴露到公网。请确认该服务允许公开，并已配置必要的访问控制。</p>
           <section id="site-scan" class="site-scan" aria-labelledby="site-scan-title" hidden>
             <div class="site-scan-heading"><div><h3 id="site-scan-title">本机 Web 服务</h3><p class="muted">跳过 SSH、邮件和常见系统服务，不发送 HTTP 探测请求。点选应用可填入上游地址。</p></div><button id="site-scan-button" type="button" class="button secondary"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>扫描本机服务</button></div>
-            <div id="site-scan-panel" class="site-scan-option" hidden><strong>Harbor Panel 本机监听</strong><span id="site-scan-panel-port" class="badge neutral"></span><small>仅供查看，不可作为网站上游。</small></div>
+            <div id="site-scan-panel" class="site-scan-option" hidden><strong>Harbor Panel 本机监听</strong><span id="site-scan-panel-port" class="badge neutral"></span><small>选择下方 Harbor Panel 卡片，一键创建 Nginx 域名入口；无需 Docker 或 Caddy。域名入口默认使用 HTTP。</small></div>
             <p id="site-scan-status" class="muted" role="status" hidden></p><ul id="site-scan-results" class="site-scan-results" hidden></ul>
           </section>
         </div>
         <p id="site-form-error" class="error-text" role="alert" hidden></p>
       </div>
-      <div class="dialog-footer"><span class="muted">Let’s Encrypt 自动申请和续期；HTTPS 可能不会立即可用。</span><button id="site-submit" class="button primary" type="submit" data-sites-write>一键创建</button></div>
+      <div class="dialog-footer"><span class="muted">普通站点自动申请 HTTPS 证书；面板 Nginx 入口默认使用 HTTP。</span><button id="site-submit" class="button primary" type="submit" data-sites-write>一键创建</button></div>
     </form>
   </dialog>
   <dialog id="site-credentials-dialog" class="site-dialog site-credentials-dialog" aria-labelledby="site-credentials-title">

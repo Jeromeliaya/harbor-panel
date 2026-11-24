@@ -592,10 +592,10 @@ function renderSitesContent(page) {
 
 function renderSiteList(sites) {
   const rows = Array.isArray(sites) ? sites : [];
-  return `<div class="section-note">请先将域名的 A / AAAA 记录指向本机公网 IP，并开放 TCP 80 / 443。启用站点后，Let’s Encrypt 会自动申请和续期证书；任务完成不代表 HTTPS 已就绪。</div>
+  return `<div class="section-note">请先将域名指向本机公网 IP，并放行入口端口。普通站点使用 Caddy 申请 HTTPS 证书；选择 Harbor Panel 本机端口时，会自动安装并配置 Nginx HTTP 入口，可通过域名访问。Nginx 与 Caddy 的 TCP 80 入口不能同时占用。</div>
     <section class="panel"><div class="toolbar"><div class="toolbar-group">${icon("globe")}<h2 class="site-table-title">网站列表</h2></div><span class="badge neutral">${rows.length} 个</span></div>
     ${rows.length ? `<div class="table-scroll"><table><thead><tr><th scope="col">主域名</th><th scope="col">站点服务</th><th scope="col">上游地址</th><th scope="col">路由状态</th><th scope="col">操作</th></tr></thead><tbody>
-    ${rows.map((site, index) => `<tr><td class="mono">${escapeHTML(site.domain)}</td><td>${Object.hasOwn(siteKinds, site.kind) ? siteKinds[site.kind] : "未知类型"}</td><td class="mono cell-secondary">${escapeHTML(site.upstream || "—")}</td><td><span class="badge ${site.enabled ? "green" : "neutral"}">${site.enabled ? "已启用" : "已停用"}</span></td><td><div class="site-actions"><button class="button secondary" type="button" data-sites-write data-site-index="${index}" data-action="${site.enabled ? "disable" : "enable"}">${site.enabled ? "停用" : "启用"}</button><button class="button secondary site-remove" type="button" data-sites-write data-site-index="${index}" data-action="remove">移除</button></div></td></tr>`).join("")}
+    ${rows.map((site, index) => `<tr><td class="mono">${site.panel && site.enabled ? `<a href="http://${escapeHTML(site.domain)}" target="_blank" rel="noopener noreferrer">http://${escapeHTML(site.domain)}</a>` : escapeHTML(site.domain)}</td><td>${site.panel ? "Harbor Panel · Nginx" : Object.hasOwn(siteKinds, site.kind) ? siteKinds[site.kind] : "未知类型"}</td><td class="mono cell-secondary">${escapeHTML(site.upstream || "—")}</td><td><span class="badge ${site.enabled ? "green" : "neutral"}">${site.enabled ? "已启用" : "已停用"}</span></td><td><div class="site-actions"><button class="button secondary" type="button" data-sites-write data-site-index="${index}" data-action="${site.enabled ? "disable" : "enable"}">${site.enabled ? "停用" : "启用"}</button><button class="button secondary site-remove" type="button" data-sites-write data-site-index="${index}" data-action="remove">移除</button></div></td></tr>`).join("")}
     </tbody></table></div>` : empty("还没有网站", "点击右上角「新建网站」部署 WordPress 或添加反向代理。", "globe")}</section>
     <p class="sites-footnote muted">停用仅关闭公开入口。移除 WordPress 会尝试清理专用容器和网络，但保留数据卷。</p>`;
 }
@@ -700,13 +700,13 @@ function parseSiteUpstream(input, kind) {
 
 function renderSiteScan() {
   const port = siteDraft?.panelPort;
-  $("site-scan-panel").hidden = !port;
+  const services = siteDraft?.services || [];
+  $("site-scan-panel").hidden = !port || !services.some((entry) => entry.panel);
   $("site-scan-panel-port").textContent = port ? `TCP ${port}` : "";
   const status = $("site-scan-status");
   status.textContent = siteDraft?.scanStatus || "";
   status.hidden = !status.textContent;
   const list = $("site-scan-results");
-  const services = siteDraft?.services || [];
   list.hidden = !services.length;
   list.innerHTML = services.map((entry, index) => {
     const upstream = typeof entry.upstream === "string" && parseSiteUpstream(entry.upstream, "proxy");

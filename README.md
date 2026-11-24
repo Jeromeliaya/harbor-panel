@@ -19,7 +19,7 @@
 | 外观主题 | 苔影花园、等高线、月下档案、陶土织纹四套图案主题；支持本机上传背景、切换和移除，重启后保留 |
 | 进程监控 | 真实 PID、进程名称、所属用户、状态、RSS；按内存降序显示前 150 个可访问进程 |
 | 网站 | 原生 Linux 支持一键 WordPress、IP/端口与 HTTPS 域名反代、本机 TCP 监听列表、环境管理及 Let’s Encrypt 自动 HTTPS |
-| 设置 | HTTPS 下支持 Passkey 和 Google Authenticator；原生 root systemd 部署可管理系统 SSH 端口及面板端口，并联动已配置的 Nginx 反代 |
+| 设置 | HTTP / HTTPS 支持 Google Authenticator 与端口设置；Passkey 支持 HTTPS 域名和 HTTP localhost；原生 root systemd 支持 SSH / 面板端口和 Nginx 联动 |
 | 操作审计 | 登录、退出、文件变更、SSH 连接/断开、外观、容器、网站及设置请求；不记录 SSH 密码、终端内容或两步验证凭证，SQLite 保留最近 10,000 条 |
 | 入口保护 | 密码散列验证、登录限速、服务端会话、HttpOnly/SameSite Cookie、Origin/Host 校验、CSRF、CSP |
 
@@ -196,9 +196,9 @@ location / {
 
 Nginx 必须和面板部署在同一 VPS，并覆盖而非透传 `X-Forwarded-Proto`。面板不信任 `X-Forwarded-For`；代理环境下审计和登录限速按代理地址统计。
 
-- **登录安全**：在「设置」中添加 Passkey 或 Google Authenticator 两步验证。启用后必须先输入管理员密码，两种方式都启用时任选一种作为第二步。新增或移除验证方式会退出全部会话。Passkey 绑定 HTTPS 域名，修改域名前应保留可用的 Google Authenticator 或其他恢复途径。没有网页跳过验证的入口；建议保留第二种验证方式和 VPS 控制台访问能力。
-- **面板端口**：原生 root systemd 支持改端口。Nginx 已按上述方式接入时，面板会验证新监听和 HTTPS 代理，失败时尝试回滚；域名地址不变，服务重启后需重新登录。仅使用 HTTP 时需事先开放新端口，修改后通过新端口登录，不会自动修改防火墙。启用前请保留 VPS 控制台访问。
-- **系统 SSH 端口**：只管理支持重载的系统 OpenSSH，不影响面板内置终端。需要 root 专用的 `/etc/ssh/harbor-panel-ports.conf`（只包含当前 `Port`，例如 `Port 22`），并在 `sshd_config` 的全局部分、所有 `Match` 之前加入 `Include /etc/ssh/harbor-panel-ports.conf`，避免重复或冲突的 `Port` 配置。先验证 `sshd -t`。不要关闭原 SSH 会话；放行新端口后另开 SSH 连接，核对主机指纹并成功登录，再在 5 分钟内确认。未确认会尝试回滚。systemd socket activation、OpenRC 与默认 Compose 不支持网页改系统 SSH 端口。
+- **登录安全**：HTTP IP:端口与 HTTPS 均可添加 Google Authenticator。Passkey 受浏览器安全上下文限制：公网 HTTP 无法创建或使用；HTTPS 域名或 `http://localhost` 可以。可用 `ssh -L 18088:127.0.0.1:8088 root@服务器IP` 后打开 `http://localhost:18088`（替换实际 SSH / 面板端口）。localhost 的 Passkey 只能在 localhost 下使用，不能转用于公网 IP 或其他域名。HTTP 不加密密码和密钥，建议通过隧道设置。启用两步验证后，密码不能绕过第二步；新增或移除会退出全部会话。保留 Google Authenticator 和 VPS 控制台作为恢复途径。
+- **面板端口**：原生 root systemd 支持改端口。手动 HTTPS Nginx 或一键创建的 HTTP Nginx 入口会同步更新上游，验证失败时尝试回滚；域名地址不变，服务重启后需重新登录。直接使用 IP:端口时需事先开放新端口，修改后通过新端口登录；不会自动修改防火墙。
+- **系统 SSH 端口**：通过 IP:端口或 HTTPS 均可验证身份并修改。标准、单端口、通配监听的系统 OpenSSH 会自动准备专用端口片段和全局 Include，校验其他 SSH 设置未变后才应用；自定义、冲突配置会报错，不会强行覆盖。只管理支持重载的系统 OpenSSH，不影响面板内置终端。保留原 SSH 会话，放行新端口并从外部另开连接，核对指纹、登录成功后在 5 分钟内确认；否则尝试回滚。systemd socket activation、OpenRC 与默认 Compose 不支持网页改系统 SSH 端口。
 - **恢复中断的切换**：如界面报告回滚失败或重启主机后仍有未完成任务，从 VPS 控制台检查状态目录中的 `host-settings.jobs.json`。可用安装目录中的 `.venv/bin/python host_settings.py --recover --worker <状态目录> <任务ID>` 仅尝试回滚该任务。不确定时先备份相关配置，不要强制覆盖现有文件。
 
 ### Docker 管理
@@ -207,14 +207,15 @@ Nginx 必须和面板部署在同一 VPS，并覆盖而非透传 `X-Forwarded-Pr
 
 ### 网站：站点管理与环境管理
 
-1. 原生 Linux root 部署中，打开「网站 → 环境管理」，先准备 Docker，再安装面板专用 Caddy。Debian/Ubuntu 和 Alpine 支持面板内安装 Docker；其他系统可使用手动安装的标准本机 Docker。启动和重启用 systemd 或 OpenRC。Docker 重启可能中断已有容器，请安排维护窗口。
-2. 将主域名的 DNS A 记录指向 VPS 的公网 IPv4；有 AAAA 记录时，IPv6 也必须指向同一台 VPS。开放公网 TCP 80/443，允许出站访问 Docker Hub 和 Let’s Encrypt。面板不会接管已占用 80/443 的 Web 服务，包括已有的面板 HTTPS 代理；请先规划端口，否则不能创建站点。默认 Compose 和 Windows 不启用宿主机网站管理。
+1. 仅给面板绑定 HTTP 域名时，直接新建网站并选择扫描列表中的 Harbor Panel，无需 Docker。其他应用和 WordPress：打开「网站 → 环境管理」，先准备 Docker，再安装面板专用 Caddy。Debian/Ubuntu 和 Alpine 支持面板内安装 Docker；其他系统可使用手动安装的标准本机 Docker。启动和重启用 systemd 或 OpenRC。Docker 重启可能中断已有容器，请安排维护窗口。
+2. 将主域名的 DNS A 记录指向 VPS 的公网 IPv4；有 AAAA 记录时，IPv6 也必须指向同一台 VPS。面板 Nginx HTTP 入口需要开放公网 TCP 80；普通 HTTPS 站点需要 TCP 80/443，并允许出站访问 Docker Hub 和 Let’s Encrypt。面板不会接管已占用入口端口的 Web 服务；请先规划端口，否则不能创建站点。默认 Compose 和 Windows 不启用宿主机网站管理。
 3. 打开「站点管理」右上角的「新建网站」，选 WordPress、IP/端口反代或域名反代，再点「一键创建」。专用 Caddy 异步申请并续签证书；创建成功表示路由已加载，不代表证书已签发。若等待后仍无法 HTTPS 访问，请检查 DNS、防火墙及 `docker logs harbor-panel-caddy`。
 
-- **IP/端口反代**：支持本机、内网、公网 IP 和域名加端口，例如 `127.0.0.1:3000`、`192.168.1.10:8080`。点击「扫描本机服务」会读取宿主机 TCP 监听和 Docker 已发布端口，跳过 SSH、TCP 25、常见系统服务及无法识别归属的监听。面板自身的监听端口单独显示，只供查看，不能作为上游。扫描不发探测请求，不保证每个结果都提供 HTTP；可点选应用卡片或手动填写上游。Docker 名称示例 `app:80` 要求唯一匹配且目标容器端口已发布，建议绑定固定的回环端口。
+- **IP/端口反代**：支持本机、内网、公网 IP 和域名加端口，例如 `127.0.0.1:3000`、`192.168.1.10:8080`。扫描跳过 SSH、TCP 25、常见系统进程，保留用户应用。原生 root systemd、尚未配置 HTTPS 时，列表首项为可点选的 Harbor Panel：填写域名、选择面板、一键创建，会安装 Nginx（支持 apt/dnf/yum），写入专用站点并验证本机代理，随后可打开 `http://你的域名`，原 IP:端口仍可用；无需 Docker / Caddy。DNS 和云防火墙需提前配置。本入口不申请 HTTPS 证书；需要 HTTPS 时按上文配置，Passkey 不会因 HTTP 域名而变得可用。Nginx 的 TCP 80 与 Caddy 入口冲突时会报错，不会停掉其他服务。专用 Nginx 入口可停用、启用、移除；外部改动会阻止覆盖。普通应用仍由 Caddy 托管 HTTPS。扫描不探测 HTTP 协议；Docker 服务名必须唯一且端口已发布。
 - **域名反代**：例如 `https://origin.example.com`，保留上游 HTTP Host 和 TLS 校验，不接受路径、查询参数或凭证。域名创建/启用时解析并固定到当时的 IP；上游地址有变化时可停用再启用站点以重新解析。不要将宿主机管理接口或不应公开的内网服务作为上游。
 - **WordPress**：先初始化随机管理员，再开放站点；MariaDB 不发布端口。HTTPS 面板会短暂显示凭证；也可以从可信 SSH 读取状态目录下 `websites/wordpress/<站点 ID>/admin-login`。默认状态目录为 `/var/lib/harbor-panel`。在网站 HTTPS 可用后登录并修改初始密码。不要把凭证放进截图或日志。
 - 停用只移除公开入口。移除 WordPress 站点会尝试清理专用容器和网络，保留文件及数据库卷，便于备份或手动恢复。更新面板不会删除网站。完整卸载会让面板管理的站点下线，并删除确认归属的专用 Caddy 与 WordPress 资源（可选先备份）；不会删除用户自行安装的上游服务。
+- 一键 Nginx 入口记录在状态目录的 `panel-domain.json`，只管理 `/etc/nginx/conf.d/harbor-panel.conf` 和专用上游片段。卸载会在备份和归属校验后移除入口、验证并重载 Nginx，保留 Nginx 软件及其他站点。若已有其他配置引用上游片段，会停止清理并报错。改为手动 HTTPS 前，请先在网站列表移除自动 HTTP 入口，再按上文配置 HTTPS。
 
 ### SSH 终端与外观
 

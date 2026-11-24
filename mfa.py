@@ -132,7 +132,7 @@ class MFA:
     def assertion_options(self, token, purpose, owner, origin, rp_id):
         flow = self.get(token, purpose, owner, origin)
         if not rp_id:
-            raise PanelError("Passkeys require an HTTPS domain name.", 403)
+            raise PanelError("Passkeys require an HTTPS domain or http://localhost in a supported browser.", 403)
         if flow.data is None:
             with self._db() as db:
                 keys = db.execute("SELECT credential_id FROM mfa_passkeys WHERE rp_id=?", (rp_id,)).fetchall()

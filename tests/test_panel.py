@@ -258,7 +258,7 @@ class HTTPTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(self.request("POST", "/api/mfa/remove", {**grant, "method": "totp"}, headers)[0], 403)
                 with mock.patch.object(server.host_settings, "start", return_value={"status": "queued"}) as start:
-                    self.assertEqual(self.request("POST", "/api/host-settings/change", {**change, **guest}, headers)[0], 410)
+                    self.assertEqual(self.request("POST", "/api/host-settings/change", {**change, **guest}, headers)[0], 403)
                     self.assertEqual(self.request("POST", "/api/host-settings/change", {**change, **grant}, headers)[0], 202)
                     self.assertEqual(self.request("POST", "/api/host-settings/change", {**change, **grant}, headers)[0], 410)
                     start.assert_called_once()
@@ -464,6 +464,115 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertGreater(data["total"], 0)
         self.assertEqual(data["processes"], sorted(data["processes"], key=lambda item: item["memory"], reverse=True))
+
+    def test_first_process_response_resolves_user_and_caches_real_rows(self):
+        from types import SimpleNamespace
+        process = mock.Mock()
+        process.info = {"pid": 44, "name": "application", "username": "www-data", "status": "running",
+                        "memory_info": SimpleNamespace(rss=8192)}
+        unnamed = mock.Mock()
+        unnamed.info = {"pid": 45, "name": "worker", "username": None, "status": "running",
+                        "memory_info": SimpleNamespace(rss=4096)}
+        unnamed.uids.return_value = SimpleNamespace(real=65534)
+        host = self.server.host
+        with mock.patch.object(host, "process_snapshot", None), \
+                mock.patch("host.psutil.process_iter", return_value=[unnamed, process]) as iterator:
+            first = host.processes()
+            self.assertEqual(first["processes"][0]["user"], "www-data")
+            self.assertEqual(first["processes"][0]["name"], "application")
+            self.assertEqual(first["processes"][1]["user"], "65534")
+            self.assertEqual(host.processes(), first)
+            iterator.assert_called_once()
+
+    def test_http_totp_and_scoped_ssh_authorization(self):
+        import pyotp
+        self.login()
+        auth = self.server.auth
+        try:
+            self.assertTrue(self.request("GET", "/api/mfa")[1]["available"])
+            self.assertFalse(self.request("GET", "/api/mfa")[1]["passkey_available"])
+            password = {"password": "test-password-long-enough"}
+            status, grant, _ = self.request("POST", "/api/mfa/reauth", password)
+            self.assertEqual(status, 200)
+            status, draft, _ = self.request("POST", "/api/mfa/enroll/start", {**grant, "method": "totp"})
+            self.assertEqual(status, 200)
+            totp = pyotp.TOTP(draft["secret"])
+            with mock.patch("mfa.time.time", return_value=1_800_000_000):
+                self.assertEqual(self.request("POST", "/api/mfa/enroll/finish",
+                    {"enrollment_id": draft["enrollment_id"], "code": totp.at(1_800_000_000)})[0], 200)
+            self.cookie = self.csrf = ""
+            status, flow, _ = self.request("POST", "/api/login", {**password, "username": "administrator"})
+            self.assertEqual(status, 202)
+            with mock.patch("mfa.time.time", return_value=1_800_000_060):
+                status, session, headers = self.request("POST", "/api/login/mfa/verify",
+                    {"challenge": flow["challenge"], "method": "totp", "code": totp.at(1_800_000_060)})
+            self.assertEqual(status, 200)
+            self.cookie, self.csrf = headers["Set-Cookie"].split(";", 1)[0], session["csrf"]
+            status, flow, _ = self.request("POST", "/api/mfa/reauth", {**password, "scope": "listener"})
+            self.assertEqual(status, 200)
+            with mock.patch("mfa.time.time", return_value=1_800_000_120):
+                status, grant, _ = self.request("POST", "/api/mfa/reauth/verify",
+                    {"challenge": flow["challenge"], "method": "totp", "code": totp.at(1_800_000_120)})
+            self.assertEqual(status, 200)
+            with mock.patch.object(self.server.host_settings, "start", return_value={"status": "queued"}) as start:
+                self.assertEqual(self.request("POST", "/api/host-settings/change",
+                    {**grant, "kind": "ssh", "port": 2222, "firewall_ready": True})[0], 202)
+                start.assert_called_once_with("ssh", 2222, firewall_ready=True)
+        finally:
+            with auth.mfa._db() as db:
+                db.execute("DELETE FROM mfa_totp")
+            auth.mfa.clear()
+
+    def test_http_localhost_can_start_passkey_enrollment_but_ip_cannot(self):
+        self.login()
+        password = {"password": "test-password-long-enough"}
+        status, grant, _ = self.request("POST", "/api/mfa/reauth", password)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.request("POST", "/api/mfa/enroll/start", {**grant, "method": "passkey"})[0], 403)
+        headers = {"Origin": f"http://localhost:{self.port}", "Host": f"localhost:{self.port}"}
+        self.assertTrue(self.request("GET", "/api/mfa", headers=headers)[1]["passkey_available"])
+        status, grant, _ = self.request("POST", "/api/mfa/reauth", password, headers)
+        self.assertEqual(status, 200)
+        status, draft, _ = self.request("POST", "/api/mfa/enroll/start", {**grant, "method": "passkey"}, headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(draft["options"]["rp"]["id"], "localhost")
+
+    def test_public_ip_http_can_authorize_ssh_change_without_https(self):
+        self.login()
+        origin = "http://203.0.113.7:8088"
+        headers = {"Origin": origin, "Host": "203.0.113.7:8088"}
+        with mock.patch.object(self.server, "public_bind", True):
+            status, security, _ = self.request("GET", "/api/mfa", headers=headers)
+            self.assertEqual(status, 200)
+            self.assertTrue(security["available"])
+            self.assertFalse(security["passkey_available"])
+            status, grant, _ = self.request("POST", "/api/mfa/reauth",
+                {"password": "test-password-long-enough", "scope": "listener"}, headers)
+            self.assertEqual(status, 200)
+            with mock.patch.object(self.server.host_settings, "start", return_value={"status": "queued"}) as start:
+                self.assertEqual(self.request("POST", "/api/host-settings/change",
+                    {**grant, "kind": "ssh", "port": 2222, "firewall_ready": True}, headers)[0], 202)
+                start.assert_called_once_with("ssh", 2222, firewall_ready=True)
+
+    def test_managed_panel_domain_is_explicit_and_health_proof_matches_instance(self):
+        from host_settings import HEALTH_PATH
+        domain = "panel.example.test"
+        headers = {"Origin": f"http://{domain}", "Host": domain}
+        panel = self.server.panel_proxy
+        try:
+            panel.site = {"id": "1" * 16, "domain": domain, "enabled": True}
+            panel.probe = {"nonce": "a" * 32, "proof": "b" * 64}
+            self.server._panel_domain_changed()
+            self.assertEqual(self.request("GET", "/api/setup", headers=headers)[0], 200)
+            self.assertEqual(self.request("GET", HEALTH_PATH + "?nonce=" + "a" * 32, headers=headers)[:2],
+                             (200, {"proof": "b" * 64}))
+            panel.probe = None
+            self.assertEqual(self.request("GET", HEALTH_PATH + "?nonce=" + "a" * 32, headers=headers)[0], 404)
+            self.assertEqual(self.request("GET", "/api/setup", headers={"Host": "other.example.test"})[0], 403)
+        finally:
+            panel.site = panel.probe = None
+            self.server._panel_domain_changed()
+        self.assertEqual(self.request("GET", "/api/setup", headers=headers)[0], 403)
 
     def test_file_round_trip_and_audit_excludes_content(self):
         self.login()

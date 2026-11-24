@@ -11,6 +11,7 @@
 !sites.py
 !mfa.py
 !host_settings.py
+!panel_proxy.py
 !LICENSE
 !web/
 !web/index.html

@@ -451,7 +451,7 @@ set_shortcut() {
 
 uninstall_panel() (
     # The installed helper may be missing or older than this downloaded menu.
-    helper_sha='7e04707c7c854709bd00fd8653818ca476d1d2e9e7df3f9d458aca91f201ad21'
+    helper_sha='16d253aa952a549182df702463546e0e8d81a1c2ced229134704da834fc26878'
     helper="$APP_DIR/deploy/menu_admin.py"
     digest_matches() {
         actual=$(sha256sum < "$1") && [ "${actual%% *}" = "$helper_sha" ]

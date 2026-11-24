@@ -23,6 +23,8 @@ CONFIG = (PATHS, Path('/etc/harbor-panel.port'), Path('/etc/harbor-panel.env'))
 SYSTEMD = Path('/etc/systemd/system/harbor-panel.service')
 OPENRC = Path('/etc/init.d/harbor-panel')
 OPENRC_LOG = Path('/var/log/harbor-panel.log')
+NGINX_ENTRY = Path('/etc/nginx/conf.d/harbor-panel.conf')
+NGINX_UPSTREAM = Path('/etc/harbor-panel.nginx-upstream')
 # Exact published service templates, including releases before ownership markers.
 UNIT_HASHES = {
     'harbor-panel.service': {
@@ -209,7 +211,8 @@ class Installation:
         primary = {'audit.sqlite3', 'auth.sqlite3', 'bootstrap.token'}
         legacy = primary | {'audit.sqlite3-wal', 'audit.sqlite3-shm', 'auth.sqlite3-wal', 'auth.sqlite3-shm',
                             'appearance.json', 'background-image', 'ssh_known_hosts', 'local-ssh', 'websites',
-                            'host-settings.jobs.json', 'host-settings.lock', 'host-settings.worker.lock'}
+                            'host-settings.jobs.json', 'host-settings.lock', 'host-settings.worker.lock',
+                            'panel-domain.json'}
         if recorded:
             legacy |= {'workspace', RECORDS}
         require(entries <= legacy and (bool(entries & primary) or recorded),
@@ -745,6 +748,50 @@ Do not start a new WordPress initialization over restored files or MariaDB data.
         raise
 
 
+class PanelEntry:
+    def __init__(self, i):
+        self.files = []
+        self.content = None
+        record = i.state / 'panel-domain.json'
+        if not root_file(record, optional=True):
+            require(not present(NGINX_ENTRY), 'Cannot verify the remaining Nginx panel entry without its ownership state')
+            return
+        data = json.loads(record.read_bytes())
+        require(isinstance(data, dict) and SITE_ID.fullmatch(data.get('id', ''))
+                and type(data.get('enabled')) is bool, 'Invalid managed Nginx entry record')
+        if root_file(NGINX_ENTRY, optional=True):
+            content = NGINX_ENTRY.read_bytes()
+            require(content.startswith(b'# Harbor Panel managed HTTP entry\n')
+                    and hashlib.sha256(content).hexdigest() == data.get('config_sha256'),
+                    'The managed Nginx entry changed; verify it manually')
+            self.files.append(NGINX_ENTRY)
+            self.content = content
+        if root_file(NGINX_UPSTREAM, optional=True):
+            require(re.fullmatch(rb'proxy_pass http://127\.0\.0\.1:[0-9]{1,5};\n', NGINX_UPSTREAM.read_bytes()),
+                    'The managed Nginx upstream changed; verify it manually')
+            self.files.append(NGINX_UPSTREAM)
+
+    def detach(self):
+        if self.content is None:
+            return
+        nginx, systemctl = executable('nginx'), executable('systemctl')
+        require(nginx and systemctl, 'Nginx and systemctl are required to remove the managed panel entry')
+        NGINX_ENTRY.unlink()
+        try:
+            dump = run([nginx, '-T']).stdout
+            require(f'# configuration file {NGINX_UPSTREAM}:' not in dump.splitlines(),
+                    'Another Nginx site still uses the panel upstream; detach it manually first')
+            state = run([systemctl, 'is-active', 'nginx.service'], check=False)
+            require(state.returncode in (0, 3), 'Cannot determine Nginx service state')
+            if state.returncode == 0:
+                run([systemctl, 'reload', 'nginx.service'])
+        except BaseException:
+            write_exclusive(NGINX_ENTRY, self.content)
+            run([nginx, '-t'])
+            run([systemctl, 'reload', 'nginx.service'])
+            raise
+
+
 class Cleanup:
     def __init__(self, i, launch, *, recovery):
         self.i = i
@@ -753,10 +800,12 @@ class Cleanup:
         if not recovery:
             i.ownership()
         self.service = Service(i, recovery=recovery)
+        self.entry = PanelEntry(i)
         data = i.data()
         shortcut = i.old_shortcut(data.get('shortcut'))
         self.files = [path for path in (*CONFIG, self.service.path, OPENRC_LOG)
                       if path is not None and root_file(path, optional=True)]
+        self.files.extend(self.entry.files)
         if shortcut is not None:
             self.files.append(shortcut)
         if recovery and present(SHORTCUTS):
@@ -868,6 +917,7 @@ def uninstall(i, backup, launch, *, plan=None, preview=None):
         fresh = plan.websites()
         require(fresh.signature() == websites.signature() and not any(
             work['State']['Running'] for work in fresh.containers.values()), 'Docker inventory changed during uninstall')
+        plan.entry.detach()
         destructive = True
         # Remove the exclusive proxy and WordPress listeners before deleting their state/config.
         websites.remove()
@@ -876,7 +926,7 @@ def uninstall(i, backup, launch, *, plan=None, preview=None):
         for link in plan.links:
             link.unlink(missing_ok=True)
         for path in plan.files:
-            if path != PATHS:
+            if path != PATHS and path != NGINX_ENTRY:
                 path.unlink()
         service.reload()
         if fd is not None:

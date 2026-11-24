@@ -32,14 +32,7 @@ class Host:
         self.previous_network = psutil.net_io_counters()
         self.previous_time = time.monotonic()
         self.snapshot = {}
-        pids = psutil.pids()
-        self.process_snapshot = {
-            "processes": [
-                {"pid": pid, "name": "?", "user": "?", "status": "?", "memory": 0}
-                for pid in pids[:150]
-            ],
-            "total": len(pids),
-        }
+        self.process_snapshot = None
         self.process_snapshot_at = 0.0
         self.process_lock = threading.Lock()
         self.sampler_error = None
@@ -91,26 +84,34 @@ class Host:
             return {**self.snapshot, "history": list(self.history)}
 
     def processes(self):
-        now = time.monotonic()
-        if now - self.process_snapshot_at >= 2 and self.process_lock.acquire(blocking=False):
-            threading.Thread(target=self._refresh_processes, name="harbor-processes", daemon=True).start()
-        return {"processes": list(self.process_snapshot["processes"]), "total": self.process_snapshot["total"]}
+        with self.process_lock:
+            if self.process_snapshot is None or time.monotonic() - self.process_snapshot_at >= 2:
+                self._refresh_processes()
+            return {"processes": list(self.process_snapshot["processes"]), "total": self.process_snapshot["total"]}
 
     def _refresh_processes(self):
         try:
             rows = []
-            for process in psutil.process_iter(["pid", "name", "status", "memory_info"]):
+            for process in psutil.process_iter(["pid", "name", "username", "status", "memory_info"], ad_value=None):
                 try:
                     info = process.info
                     memory = info["memory_info"]
-                    rows.append({"pid": info["pid"], "name": info["name"] or "?", "user": "?", "status": info["status"], "memory": memory.rss if memory else 0})
+                    user = info["username"]
+                    if not user and hasattr(process, "uids"):
+                        try:
+                            user = str(process.uids().real)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                            pass
+                    rows.append({"pid": info["pid"], "name": info["name"] or "无权限读取",
+                                 "user": user or "无权限读取", "status": info["status"] or "无权限读取",
+                                 "memory": memory.rss if memory else 0})
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
             rows.sort(key=lambda item: item["memory"], reverse=True)
             self.process_snapshot = {"processes": rows[:150], "total": len(rows)}
             self.process_snapshot_at = time.monotonic()
-        finally:
-            self.process_lock.release()
+        except (OSError, psutil.Error) as exc:
+            raise PanelError("Host processes unavailable. Check the panel service permissions.", 503) from exc
 
     def docker_command(self, *arguments):
         executable = shutil.which("docker")

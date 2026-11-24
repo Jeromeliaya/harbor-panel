@@ -88,6 +88,19 @@ class SiteTests(unittest.TestCase):
                 {"port": 3000, "address": "127.0.0.1", "project": "mixed", "upstream": "127.0.0.1:3000"},
             ])
 
+    def test_panel_scan_is_selectable_and_creation_bypasses_caddy(self):
+        self.manager.panel_proxy = mock.Mock(enabled=True, site=None)
+        with mock.patch.object(self.manager, "_listening", return_value=[]), \
+                mock.patch.object(self.manager, "_containers", return_value=[]):
+            service = self.manager.scan()["services"][0]
+        self.assertTrue(service["panel"])
+        self.assertEqual(service["upstream"], "127.0.0.1:8088")
+        with mock.patch.object(self.manager, "_submit") as submit:
+            self.manager.create("new.example.com", "proxy", service["upstream"], "client")
+        self.assertEqual(submit.call_args.args[-2:], (self.manager.panel_proxy.create, "new.example.com"))
+        with mock.patch.object(self.manager, "_containers", return_value=[]), self.assertRaises(PanelError):
+            self.manager._target(parse_upstream("other-server:8088", "proxy"))
+
     def test_docker_binding_conflicts_even_without_listening_process(self):
         docker = {"name": "/existing-web", "ports": {"8443/tcp": [{"HostIp": "0.0.0.0", "HostPort": "443"}]}}
         with mock.patch.object(self.manager, "_listening", return_value=[]), \
