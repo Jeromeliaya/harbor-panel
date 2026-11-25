@@ -170,6 +170,19 @@ class ListenerJobs(unittest.TestCase):
         self.assertFalse(any(event[0] == "launch" for event in self.host.events))
         self.assertEqual(self.mutations(), [])
 
+    def test_all_managed_https_domains_are_verified_after_port_change(self):
+        manager = self.settings()
+        aliases = ["https://one.example.test", "https://two.example.test"]
+        with mock.patch.object(hs.HostSettings, "_managed_origins", return_value=aliases), \
+                mock.patch.object(hs.HostSettings, "_verify_panel") as verify:
+            job = manager.start("panel", 9090)
+            self.worker(job["id"])
+        self.assertEqual(manager.job(job["id"])["status"], "succeeded")
+        self.assertEqual(manager.job(job["id"])["mode"], "https_proxy")
+        for alias in aliases:
+            self.assertEqual(sum(call.args[0] == alias for call in verify.call_args_list), 2)
+        self.assertEqual(self.host.files[hs.NGINX_FILE], hs._nginx_file(9090))
+
     def test_direct_change_reports_new_port_after_service_restart(self):
         job_id = self.settings().start("panel", 9090, firewall_ready=True)["id"]
         self.worker(job_id)

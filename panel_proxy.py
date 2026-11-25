@@ -22,7 +22,11 @@ class PanelProxy:
         self.changed = changed
         self.site = None
         self.probe = None
-        if enabled and self.record.exists():
+        self.reload()
+
+    def reload(self):
+        self.site = None
+        if self.enabled and self.record.exists():
             from host_settings import _read_file
             from sites import domain_name, SITE_ID
             self.site = json.loads(_read_file(self.record))
@@ -119,6 +123,9 @@ class PanelProxy:
                 NGINX_FILE: _nginx_file(self.port) if candidate and candidate["enabled"] else None,
                 self.record: json.dumps(candidate) if candidate else None,
             }
+            from panel_domains import origins
+            if origins(self.state):
+                updated[NGINX_FILE] = _nginx_file(self.port)
             changed = []
             try:
                 for path, text in updated.items():

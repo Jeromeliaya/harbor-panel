@@ -347,6 +347,40 @@ class TestMenuAdmin(unittest.TestCase):
                                           'directories': [[10, 11], [info.st_dev, info.st_ino]]}))
             self.assertEqual(i.recovery_trees(), [i.state])
 
+    def test_https_aliases_detach_together_and_shared_certificates_block_uninstall(self):
+        root, i = self.installation_fixture()
+        entry = root / 'harbor-panel.conf'
+        upstream = root / 'upstream'
+        upstream.write_bytes(b'proxy_pass http://127.0.0.1:8088;\n')
+        domains = []
+        paths = []
+        for domain in ('one.example.com', 'two.example.com'):
+            name = 'harbor-panel-' + hashlib.sha256(domain.encode()).hexdigest()[:24]
+            path = root / (name + '.conf')
+            content = f'# Harbor Panel managed HTTPS domain\nserver {{ server_name {domain}; }}\n'.encode()
+            path.write_bytes(content)
+            paths.append(path)
+            domains.append({'domain': domain, 'enabled': True, 'config_sha256': hashlib.sha256(content).hexdigest()})
+        (i.state / 'panel-domains.json').write_bytes(json.dumps(domains).encode())
+        with self.recovery_fixture(root, i), patch.object(admin, 'NGINX_ENTRY', entry), \
+                patch.object(admin, 'NGINX_UPSTREAM', upstream), patch.object(admin, 'ACME_ROOT', root / 'acme'), \
+                patch.object(admin, 'CERT_TIMER', root / 'cert.timer'), \
+                patch.object(admin, 'CERT_SERVICE', root / 'cert.service'), \
+                patch.object(admin, 'executable', side_effect=lambda name: name), \
+                patch.object(admin, 'write_exclusive', side_effect=lambda p, data: p.write_bytes(data)), \
+                patch.object(admin, 'run', return_value=SimpleNamespace(stdout='', returncode=0)) as command:
+            plan = admin.PanelEntry(i)
+            self.assertEqual(set(plan.entries), set(paths))
+            with patch.object(admin, 'run', return_value=SimpleNamespace(
+                    stdout=f'ssl_certificate /live/{plan.certificates[0]}/fullchain.pem;', returncode=0)):
+                with self.assertRaisesRegex(admin.Unsafe, 'still uses a panel certificate'):
+                    plan.detach()
+            self.assertTrue(all(path.exists() for path in paths))
+            plan.detach()
+            self.assertFalse(any(path.exists() for path in paths))
+            self.assertTrue(upstream.exists())
+            command.assert_any_call(['systemctl', 'reload', 'nginx.service'])
+
     def test_downloaded_menu_cleanup_runs_with_no_installed_helper(self):
         sh = shutil.which('sh')
         if sh is None:
@@ -403,3 +437,7 @@ python3() { printf 'called cleanup: %s %s %s\\n' "$3" "$4" "$5"; }
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('5. 设置面板快捷', stdout)
         self.assertIn('mock <shortcut>\nmock <港口>\nmock <caller-path>', stdout)
+        result = subprocess.run([sh, '-c', fake + prompt], input=b'4\n0\n', capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('4. 添加域名访问'.encode(), result.stdout)
+        self.assertIn('尚未安装 Harbor Panel'.encode(), result.stdout)

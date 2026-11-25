@@ -260,7 +260,7 @@ class HostOperations:
         self.command("nginx", "-t")
         self.command("systemctl", "reload", "nginx.service")
 
-    def probe_panel(self, base, nonce, proof):
+    def probe_panel(self, base, nonce, proof, *, local_https=False):
         verified = threading.Event()
 
         def request(connection, host=None):
@@ -280,7 +280,8 @@ class HostOperations:
                 if origin.scheme == "https" and origin.hostname:
                     hostname = origin.hostname.encode("idna").decode("ascii")
                     port = origin.port or 443
-                    endpoints = _local_https_endpoints(hostname, port)
+                    endpoints = ([(socket.AF_INET, ("127.0.0.1", port))] if local_https
+                                 else _local_https_endpoints(hostname, port))
                     context = ssl.create_default_context()
                     if all(request(_LocalHTTPSConnection(hostname, port, endpoint, context)) for endpoint in endpoints):
                         verified.set()
@@ -448,9 +449,24 @@ class HostSettings:
     def _proxy_origin(self):
         if self.public_origin:
             return self.public_origin.rstrip("/")
+        managed = self._managed_origins()
+        if managed:
+            return managed[0]
+        return self._legacy_origin()
+
+    def _legacy_origin(self):
         from panel_proxy import PanelProxy
         site = PanelProxy(self.state, self.panel_port, enabled=self.full_host).site
         return f"http://{site['domain']}" if site and site["enabled"] else None
+
+    def _managed_origins(self):
+        from panel_domains import origins
+        return origins(self.state) if self.full_host else []
+
+    def _proxy_origins(self):
+        primary = self._proxy_origin()
+        legacy = self._legacy_origin() if not self.public_origin else None
+        return list(dict.fromkeys(([primary] if primary else []) + self._managed_origins() + ([legacy] if legacy else [])))
 
     def _require(self):
         if not self._supported():
@@ -563,7 +579,7 @@ class HostSettings:
 
     def status(self):
         proxy_origin = self._proxy_origin()
-        mode = "https_proxy" if self.public_origin else ("http_proxy" if proxy_origin else "direct")
+        mode = "https_proxy" if proxy_origin and proxy_origin.startswith("https:") else ("http_proxy" if proxy_origin else "direct")
         panel = {"port": self.panel_port, "mode": mode, "public_origin": self.public_origin,
                  "proxy_origin": proxy_origin, "available": False, "reason": None}
         ssh = {"ports": [], "available": False, "reason": None}
@@ -609,7 +625,7 @@ class HostSettings:
                     raise _error("Previous rollback failed; recover from the VPS console first.")
                 if jobs and jobs[-1]["status"] in ACTIVE:
                     raise PanelError("A listener change is already in progress.", 409, code="listener_busy")
-                mode = "ssh" if kind == "ssh" else ("https_proxy" if self.public_origin else
+                mode = "ssh" if kind == "ssh" else ("https_proxy" if (self._proxy_origin() or "").startswith("https:") else
                                                   ("http_proxy" if self._proxy_origin() else "direct"))
                 if kind == "panel":
                     old = self.panel_port
@@ -695,15 +711,19 @@ class HostSettings:
             time.sleep(0.5)
 
     def _verify_panel(self, base, probe, message):
-        self._wait(lambda: self.ops.probe_panel(base, probe["nonce"], probe["proof"]), message)
+        def request():
+            if base in self._managed_origins():
+                return self.ops.probe_panel(base, probe["nonce"], probe["proof"], local_https=True)
+            return self.ops.probe_panel(base, probe["nonce"], probe["proof"])
+        self._wait(request, message)
 
     def _switch_panel(self, job):
         job_id, old, port = job["id"], job["old_port"], job["port"]
         files = self._preflight_panel(old)
-        origin = self._proxy_origin()
+        origins = self._proxy_origins()
         probe = self._probe(job, old)
         self._verify_panel(f"http://127.0.0.1:{old}", probe, "Could not verify the current local panel listener.")
-        if origin:
+        for origin in origins:
             self._verify_panel(origin, probe, "Could not verify same-host HTTPS routing and TLS for the configured origin. No files were changed.")
         self.ops.free_port(port)
         probe = self._probe(job, port)
@@ -711,13 +731,14 @@ class HostSettings:
         _swap(PORT_FILE, files["panel"], _panel_file(port))
         self.ops.command("systemctl", "restart", PANEL_UNIT)
         self._verify_panel(f"http://127.0.0.1:{port}", probe, "The panel did not come up on its new local port.")
-        if origin:
+        if origins:
             self._update(job_id, rollback={"files": files, "panel": True, "nginx": True},
                          message="Testing the HTTPS proxy on the new local port.")
             _swap(NGINX_FILE, files["nginx"], _nginx_file(port))
             self.ops.https_proxy(port, _nginx_file(port))
             self.ops.reload_nginx()
-            self._verify_panel(origin, probe, "The HTTPS origin did not reach the new local panel listener.")
+            for origin in origins:
+                self._verify_panel(origin, probe, "The domain did not reach the new local panel listener.")
             return f"Panel now listens on TCP {port}. Your public domain address is unchanged."
         return f"Panel now listens on TCP {port}. Use the new port; cloud and host firewall access was not verified."
 
@@ -775,8 +796,8 @@ class HostSettings:
             probe = self._probe(job, old)
             self.ops.command("systemctl", "restart", PANEL_UNIT)
             self._verify_panel(f"http://127.0.0.1:{old}", probe, "The old local panel listener was not verified.")
-            if self._proxy_origin():
-                self._verify_panel(self._proxy_origin(), probe, "The old proxy route was not verified.")
+            for origin in self._proxy_origins():
+                self._verify_panel(origin, probe, "The old proxy route was not verified.")
         except (OSError, PanelError, ValueError) as exc:
             errors.append(self._reason(exc))
         if errors:

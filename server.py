@@ -309,6 +309,9 @@ class PanelServer(ThreadingHTTPServer):
         self.allowed_hosts = {urlsplit(origin).netloc.lower() for origin in self.origins}
         try:
             from panel_proxy import PanelProxy
+            self.managed_tls_domains = set()
+            self.managed_origins = set()
+            self.domain_lock = threading.Lock()
             self.panel_http_domain = None
             self.panel_proxy = PanelProxy(state, port, self.full_host_root and not self.public_origin and HostOperations().available(),
                                           changed=self._panel_domain_changed)
@@ -336,6 +339,26 @@ class PanelServer(ThreadingHTTPServer):
             self.origins.add(f"http://{self.panel_http_domain}")
             if hasattr(self, "sites"):
                 self.sites.panel_hosts.add(self.panel_http_domain)
+
+    def refresh_domains(self):
+        if not self.full_host_root:
+            return
+        from panel_domains import load
+        with self.domain_lock:
+            previous = self.panel_proxy.site
+            self.panel_proxy.reload()
+            if previous != self.panel_proxy.site:
+                self._panel_domain_changed()
+            domains = {item["domain"] for item in load(self.state_dir) if item["enabled"]}
+            for origin in self.managed_origins:
+                self.origins.discard(origin)
+                self.allowed_hosts.discard(urlsplit(origin).netloc)
+                self.sites.panel_hosts.discard(urlsplit(origin).hostname)
+            self.managed_tls_domains = domains
+            self.managed_origins = {f"https://{domain}" for domain in domains}
+            self.origins.update(self.managed_origins)
+            self.allowed_hosts.update(domains)
+            self.sites.panel_hosts.update(domains)
 
     def server_close(self):
         if hasattr(self, "terminal"):
@@ -444,12 +467,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def _cookie(self, token, expired=False):
         value = f"harbor_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={0 if expired else Auth.TTL}"
-        return value + ("; Secure" if self.server.secure_cookie else "")
+        return value + ("; Secure" if self._secure_transport() else "")
+
+    def _secure_transport(self):
+        return self.server.secure_cookie or bool(
+            self.headers.get("Host", "").lower() in self.server.managed_tls_domains
+            and ipaddress.ip_address(self.client_address[0]).is_loopback
+            and self.headers.get_all("X-Forwarded-Proto") == ["https"])
 
     def _mfa_origin(self, mutation):
         origin = self.server.public_origin
+        host = self.headers.get("Host", "").lower()
+        if host in self.server.managed_tls_domains:
+            origin = f"https://{host}"
+            if not self._secure_transport():
+                return None
+            return origin if not mutation or self.headers.get_all("Origin") == [origin] else None
         if not origin:
-            host = self.headers.get("Host", "").lower()
             origin = f"http://{host}"
             if mutation and self.headers.get_all("Origin") != [origin]:
                 return None
@@ -469,7 +503,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(origin)
         if parsed.scheme == "http":
             return "localhost" if parsed.hostname == "localhost" else None
-        return self.server.rp_id
+        return parsed.hostname if parsed.hostname in self.server.managed_tls_domains else self.server.rp_id
 
     def _respond_login(self, result, address):
         previous_token = self._token()
@@ -494,8 +528,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, mutation):
         try:
+            self.server.refresh_domains()
             host = self.headers.get("Host", "").lower()
             parsed = urlsplit(self.path)
+            if host in self.server.managed_tls_domains and not self._secure_transport():
+                raise PanelError("Use the managed HTTPS domain through its local Nginx proxy.", 403)
             local_health = (self.command == "GET" and parsed.path == HEALTH_PATH
                             and host == f"127.0.0.1:{self.server.server_port}"
                             and ipaddress.ip_address(self.client_address[0]).is_loopback)
@@ -512,6 +549,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("Sec-Fetch-Site") == "cross-site" and not navigation:
                 raise PanelError("Cross-site requests are not allowed.", 403)
             origin = self.headers.get("Origin")
+            if host in self.server.managed_tls_domains and (origin or mutation) and origin != f"https://{host}":
+                raise PanelError("An exact HTTPS domain Origin is required.", 403)
             public_origin = f"http://{host}"
             if origin and origin not in self.server.origins and not (self.server.public_bind and not self.server.secure_cookie and origin == public_origin):
                 raise PanelError("Origin is not allowed.", 403)
@@ -523,10 +562,16 @@ class Handler(BaseHTTPRequestHandler):
             address = self.client_address[0]
             if path == HEALTH_PATH and self.command == "GET":
                 nonce = query.get("nonce", [])
+                if self.server.full_host_root and (local_health or (host in self.server.managed_tls_domains and self._secure_transport())) and len(nonce) == 1:
+                    from panel_domains import health
+                    proof = health(self.server.state_dir, nonce[0])
+                    if proof:
+                        self._respond(200, proof)
+                        return
                 managed_probe = (host == self.server.panel_http_domain
                                  and ipaddress.ip_address(self.client_address[0]).is_loopback)
                 allowed_probe = (local_health or (self._mfa_origin(False) if self.server.public_origin else False)
-                                 or managed_probe)
+                                 or managed_probe or (host in self.server.managed_tls_domains and self._secure_transport()))
                 pending = self.server.panel_proxy.probe
                 if managed_probe and pending and len(nonce) == 1 and hmac.compare_digest(nonce[0], pending["nonce"]):
                     proof = {"proof": pending["proof"]}
@@ -535,7 +580,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(200 if proof else 404, proof or {"error": "Not found."})
                 return
             if path == "/api/setup" and self.command == "GET":
-                self._respond(200, {"required": self.server.auth.setup_required(), "full_host": self.server.full_host, "full_host_root": self.server.full_host_root, "public_http": self.server.public_bind and not self.server.secure_cookie})
+                self._respond(200, {"required": self.server.auth.setup_required(), "full_host": self.server.full_host, "full_host_root": self.server.full_host_root, "public_http": self.server.public_bind and not self._secure_transport()})
                 return
             mfa_origin = self._mfa_origin(mutation)
             if self.command == "POST" and path in ("/api/login", "/api/login/mfa/options", "/api/login/mfa/verify"):
@@ -578,7 +623,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._write_mfa(path.removeprefix("/api/mfa/"), token, address, mfa_origin)
                     return
                 if path == "/api/terminal/ws" and self.command == "GET":
-                    self.server.terminal.serve(self, token, session, self.server.secure_cookie)
+                    self.server.terminal.serve(self, token, session, self._secure_transport())
                     return
                 if not mutation:
                     self._get_api(path, relative, query, session)
@@ -632,7 +677,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _get_api(self, path, relative, query, session):
         if path == "/api/session":
-            result = {"csrf": session["csrf"], "version": "0.1.0", "file_root": str(self.server.files.root), "platform": os.name, "commands": list(Host.COMMANDS), "full_host": self.server.full_host, "full_host_root": self.server.full_host_root, "public_http": self.server.public_bind and not self.server.secure_cookie, "https_remote_ssh": self.server.secure_cookie}
+            result = {"csrf": session["csrf"], "version": "0.1.0", "file_root": str(self.server.files.root), "platform": os.name, "commands": list(Host.COMMANDS), "full_host": self.server.full_host, "full_host_root": self.server.full_host_root, "public_http": self.server.public_bind and not self._secure_transport(), "https_remote_ssh": self._secure_transport()}
         elif path == "/api/host-settings":
             result = self.server.host_settings.status()
         elif path == "/api/host-settings/job":

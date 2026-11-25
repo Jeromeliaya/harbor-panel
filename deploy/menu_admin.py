@@ -25,6 +25,9 @@ OPENRC = Path('/etc/init.d/harbor-panel')
 OPENRC_LOG = Path('/var/log/harbor-panel.log')
 NGINX_ENTRY = Path('/etc/nginx/conf.d/harbor-panel.conf')
 NGINX_UPSTREAM = Path('/etc/harbor-panel.nginx-upstream')
+CERT_SERVICE = Path('/etc/systemd/system/harbor-panel-certificates.service')
+CERT_TIMER = CERT_SERVICE.with_suffix('.timer')
+ACME_ROOT = Path('/run/harbor-panel-acme')
 # Exact published service templates, including releases before ownership markers.
 UNIT_HASHES = {
     'harbor-panel.service': {
@@ -212,7 +215,7 @@ class Installation:
         legacy = primary | {'audit.sqlite3-wal', 'audit.sqlite3-shm', 'auth.sqlite3-wal', 'auth.sqlite3-shm',
                             'appearance.json', 'background-image', 'ssh_known_hosts', 'local-ssh', 'websites',
                             'host-settings.jobs.json', 'host-settings.lock', 'host-settings.worker.lock',
-                            'panel-domain.json'}
+                            'panel-domain.json', 'panel-domains.json', 'panel-domain-probe.json', 'tls'}
         if recorded:
             legacy |= {'workspace', RECORDS}
         require(entries <= legacy and (bool(entries & primary) or recorded),
@@ -752,41 +755,99 @@ class PanelEntry:
     def __init__(self, i):
         self.files = []
         self.content = None
+        self.entries = {}
+        self.certificates = []
+        self.tls = str(i.state / 'tls')
+        self.acme = False
         record = i.state / 'panel-domain.json'
+        domains = i.state / 'panel-domains.json'
+        if root_file(domains, optional=True):
+            data = json.loads(domains.read_bytes())
+            require(isinstance(data, list), 'Invalid HTTPS domain records')
+            for item in data:
+                domain = item.get('domain', '')
+                require(re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?', domain)
+                        and type(item.get('enabled')) is bool, 'Invalid HTTPS domain')
+                name = 'harbor-panel-' + hashlib.sha256(domain.encode('ascii')).hexdigest()[:24]
+                path = NGINX_ENTRY.parent / (name + '.conf')
+                if root_file(path, optional=True):
+                    content = path.read_bytes()
+                    require(content.startswith(b'# Harbor Panel managed HTTPS domain\n')
+                            and hashlib.sha256(content).hexdigest() == item.get('config_sha256'),
+                            'The HTTPS domain configuration changed; verify it manually')
+                    self.entries[path] = content
+                    self.files.append(path)
+                self.certificates.append(name)
+            for path in (CERT_SERVICE, CERT_TIMER):
+                if root_file(path, optional=True):
+                    require(path.read_bytes().startswith(b'# Harbor Panel managed certificate renewal\n'),
+                            'Certificate renewal configuration changed; verify it manually')
+                    # Only remove our exact unit, never a replacement with the same header.
+                    expected = (
+                        '# Harbor Panel managed certificate renewal\n[Unit]\nDescription=Renew Harbor Panel HTTPS certificates\n'
+                        'After=network-online.target nginx.service\nWants=network-online.target\n'
+                        '[Service]\nType=oneshot\nUser=root\nUMask=0077\n'
+                        f'ExecStart={i.app}/.venv/bin/python -IB {i.app}/panel_domains.py renew {i.app} {i.state}\n'
+                        if path == CERT_SERVICE else
+                        '# Harbor Panel managed certificate renewal\n[Unit]\nDescription=Renew Harbor Panel HTTPS certificates\n'
+                        '[Timer]\nOnCalendar=*-*-* 03,15:00:00\nRandomizedDelaySec=3600\nPersistent=true\n'
+                        '[Install]\nWantedBy=timers.target\n')
+                    require(path.read_bytes() == expected.encode(), 'Certificate renewal unit changed')
+                    self.files.append(path)
+            if present(ACME_ROOT):
+                root_dirs(ACME_ROOT)
+                marker = ACME_ROOT / '.harbor-panel-acme'
+                root_file(marker)
+                require(marker.read_bytes() == b'Harbor Panel ACME webroot\n', 'Unknown ACME challenge directory')
+                require({p.name for p in ACME_ROOT.iterdir()} <= {marker.name, '.well-known'},
+                        'Unexpected data in ACME challenge directory')
+                no_mounts(ACME_ROOT)
+                self.acme = True
+        else:
+            require(not present(CERT_TIMER) and not present(CERT_SERVICE),
+                    'Cannot verify certificate renewal units without domain records')
         if not root_file(record, optional=True):
             require(not present(NGINX_ENTRY), 'Cannot verify the remaining Nginx panel entry without its ownership state')
-            return
-        data = json.loads(record.read_bytes())
-        require(isinstance(data, dict) and SITE_ID.fullmatch(data.get('id', ''))
-                and type(data.get('enabled')) is bool, 'Invalid managed Nginx entry record')
-        if root_file(NGINX_ENTRY, optional=True):
-            content = NGINX_ENTRY.read_bytes()
-            require(content.startswith(b'# Harbor Panel managed HTTP entry\n')
-                    and hashlib.sha256(content).hexdigest() == data.get('config_sha256'),
-                    'The managed Nginx entry changed; verify it manually')
-            self.files.append(NGINX_ENTRY)
-            self.content = content
-        if root_file(NGINX_UPSTREAM, optional=True):
+        else:
+            data = json.loads(record.read_bytes())
+            require(isinstance(data, dict) and SITE_ID.fullmatch(data.get('id', ''))
+                    and type(data.get('enabled')) is bool, 'Invalid managed Nginx entry record')
+            if root_file(NGINX_ENTRY, optional=True):
+                content = NGINX_ENTRY.read_bytes()
+                require(content.startswith(b'# Harbor Panel managed HTTP entry\n')
+                        and hashlib.sha256(content).hexdigest() == data.get('config_sha256'),
+                        'The managed Nginx entry changed; verify it manually')
+                self.files.append(NGINX_ENTRY)
+                self.content = content
+                self.entries[NGINX_ENTRY] = content
+        if (present(record) or present(domains)) and root_file(NGINX_UPSTREAM, optional=True):
             require(re.fullmatch(rb'proxy_pass http://127\.0\.0\.1:[0-9]{1,5};\n', NGINX_UPSTREAM.read_bytes()),
                     'The managed Nginx upstream changed; verify it manually')
             self.files.append(NGINX_UPSTREAM)
 
     def detach(self):
-        if self.content is None:
+        if not self.entries and not self.certificates and CERT_TIMER not in self.files:
             return
         nginx, systemctl = executable('nginx'), executable('systemctl')
         require(nginx and systemctl, 'Nginx and systemctl are required to remove the managed panel entry')
-        NGINX_ENTRY.unlink()
+        for path in self.entries:
+            path.unlink()
         try:
             dump = run([nginx, '-T']).stdout
             require(f'# configuration file {NGINX_UPSTREAM}:' not in dump.splitlines(),
                     'Another Nginx site still uses the panel upstream; detach it manually first')
+            require(not any(f'/live/{name}/' in dump for name in self.certificates),
+                    'Another Nginx site still uses a panel certificate')
+            require(self.tls not in dump, 'Another Nginx site still uses panel TLS data')
             state = run([systemctl, 'is-active', 'nginx.service'], check=False)
             require(state.returncode in (0, 3), 'Cannot determine Nginx service state')
             if state.returncode == 0:
                 run([systemctl, 'reload', 'nginx.service'])
+            if CERT_TIMER in self.files:
+                run([systemctl, 'disable', '--now', CERT_TIMER.name])
         except BaseException:
-            write_exclusive(NGINX_ENTRY, self.content)
+            for path, content in self.entries.items():
+                write_exclusive(path, content)
             run([nginx, '-t'])
             run([systemctl, 'reload', 'nginx.service'])
             raise
@@ -926,8 +987,11 @@ def uninstall(i, backup, launch, *, plan=None, preview=None):
         for link in plan.links:
             link.unlink(missing_ok=True)
         for path in plan.files:
-            if path != PATHS and path != NGINX_ENTRY:
+            if path != PATHS and path not in plan.entry.entries:
                 path.unlink()
+        if plan.entry.acme:
+            no_mounts(ACME_ROOT)
+            shutil.rmtree(ACME_ROOT)
         service.reload()
         if fd is not None:
             os.close(fd)

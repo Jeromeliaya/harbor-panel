@@ -574,6 +574,40 @@ class HTTPTests(unittest.TestCase):
             self.server._panel_domain_changed()
         self.assertEqual(self.request("GET", "/api/setup", headers=headers)[0], 403)
 
+    def test_multiple_https_domains_refresh_without_restart_and_use_separate_passkey_rp_ids(self):
+        domains = [{"domain": "one.example.test", "enabled": True},
+                   {"domain": "two.example.test", "enabled": True}]
+        headers = {"Origin": "https://one.example.test", "Host": "one.example.test",
+                   "X-Forwarded-Proto": "https"}
+        with mock.patch.object(self.server, "full_host_root", True), \
+                mock.patch.object(self.server.panel_proxy, "reload"), \
+                mock.patch("panel_domains.load", return_value=domains):
+            status, body, response = self.request("POST", "/api/login",
+                {"username": "administrator", "password": "test-password-long-enough"}, headers)
+            self.assertEqual(status, 200)
+            self.assertIn("; Secure", response["Set-Cookie"])
+            self.assertEqual(self.request("POST", "/api/login",
+                {"username": "administrator", "password": "test-password-long-enough"},
+                {**headers, "Origin": "http://one.example.test"})[0], 403)
+            self.cookie, self.csrf = response["Set-Cookie"].split(";", 1)[0], body["csrf"]
+            self.assertTrue(self.request("GET", "/api/mfa", headers=headers)[1]["passkey_available"])
+            status, grant, _ = self.request("POST", "/api/mfa/reauth",
+                {"password": "test-password-long-enough"}, headers)
+            self.assertEqual(status, 200)
+            status, draft, _ = self.request("POST", "/api/mfa/enroll/start",
+                {**grant, "method": "passkey"}, headers)
+            self.assertEqual(status, 200)
+            self.assertEqual(draft["options"]["rp"]["id"], "one.example.test")
+            other = {**headers, "Host": "two.example.test", "Origin": "https://two.example.test"}
+            self.assertTrue(self.request("GET", "/api/session", headers=other)[1]["https_remote_ssh"])
+            self.assertEqual(self.request("GET", "/api/setup", headers={**other, "X-Forwarded-Proto": "http"})[0], 403)
+            domains.pop()
+            self.assertEqual(self.request("GET", "/api/setup", headers=other)[0], 403)
+        with mock.patch.object(self.server, "full_host_root", True), \
+                mock.patch.object(self.server.panel_proxy, "reload"), mock.patch("panel_domains.load", return_value=[]):
+            self.server.refresh_domains()
+        self.assertEqual(self.request("GET", "/api/setup")[0], 200)
+
     def test_file_round_trip_and_audit_excludes_content(self):
         self.login()
         content = "sensitive-test-content-123"

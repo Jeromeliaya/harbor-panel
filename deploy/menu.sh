@@ -449,9 +449,28 @@ set_shortcut() {
     menu_admin shortcut "$shortcut" "$CALLER_PATH" "$0"
 }
 
+manage_domains() {
+    if [ ! -f "$APP_DIR/server.py" ] || [ ! -x "$APP_DIR/.venv/bin/python" ]; then
+        echo "尚未安装 Harbor Panel，请先选择 1。"
+        return
+    fi
+    domain_helper="$APP_DIR/panel_domains.py"
+    if [ ! -f "$domain_helper" ]; then
+        echo "域名管理需要新版组件，请先选择 2 更新面板。"
+        return
+    fi
+    if has_symlink_component "$domain_helper" || ! safe_root_parent "$domain_helper"; then
+        echo "拒绝运行未受保护的域名组件。" >&2
+        return 1
+    fi
+    metadata=$(stat -c '%u %a %h' "$domain_helper") || return 1
+    helper_safe "$metadata" || return 1
+    "$APP_DIR/.venv/bin/python" -IB "$domain_helper" menu "$APP_DIR" "$STATE_DIR"
+}
+
 uninstall_panel() (
     # The installed helper may be missing or older than this downloaded menu.
-    helper_sha='16d253aa952a549182df702463546e0e8d81a1c2ced229134704da834fc26878'
+    helper_sha='511da8d900c9380dfdd42f8ff50aa16839cfc2fb54a1da6d5053455a3c16f58f'
     helper="$APP_DIR/deploy/menu_admin.py"
     digest_matches() {
         actual=$(sha256sum < "$1") && [ "${actual%% *}" = "$helper_sha" ]
@@ -485,14 +504,15 @@ uninstall_panel() (
 
 while :; do
     printf '\nHarbor Panel 管理菜单\n'
-    printf '1. 安装\n2. 更新\n3. 卸载\n5. 设置面板快捷\n0. 退出\n\n请选择: '
+    printf '1. 安装\n2. 更新\n3. 卸载\n4. 添加域名访问\n5. 设置面板快捷\n0. 退出\n\n请选择: '
     IFS= read -r choice || exit 0
     case "$choice" in
         1) install_panel ;;
         2) update_panel ;;
         3) if uninstall_panel; then exit 0; fi ;;
+        4) manage_domains || : ;;
         5) set_shortcut || : ;;
         0) exit 0 ;;
-        *) echo "无效选项，请输入 1、2、3、5 或 0。" ;;
+        *) echo "无效选项，请输入 1、2、3、4、5 或 0。" ;;
     esac
 done
