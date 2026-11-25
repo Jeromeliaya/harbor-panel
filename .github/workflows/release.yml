@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          latest_tag="$(gh release list --limit 100 --json tagName,isDraft,isPrerelease \
+            --jq '[.[] | select(.isDraft == false and .isPrerelease == false)
+              | .tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | .[0] // ""')"
+
+          if [ -n "$latest_tag" ] && [ "$(git rev-list -n 1 "$latest_tag")" = "$RELEASE_SHA" ]; then
+            echo "A release already points to $RELEASE_SHA; nothing to publish."
+            exit 0
+          fi
+
+          next_tag="$(LATEST_TAG="$latest_tag" python - <<'PY'
+          import os
+
+          latest = os.environ["LATEST_TAG"]
+          if not latest:
+              print("v0.1.0")
+              raise SystemExit
+
+          major, minor, patch = (int(part) for part in latest[1:].split("."))
+          print(f"v{major}.{minor}.{patch + 1}")
+          PY
+          )"
+
+          if [ -n "$latest_tag" ]; then
+            gh release create "$next_tag" \
+              --target "$RELEASE_SHA" \
+              --title "Harbor Panel $next_tag" \
+              --generate-notes \
+              --notes-start-tag "$latest_tag"
+          else
+            gh release create "$next_tag" \
+              --target "$RELEASE_SHA" \
+              --title "Harbor Panel $next_tag" \
+              --generate-notes
+          fi
