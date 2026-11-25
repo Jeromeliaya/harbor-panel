@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -21,6 +25,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_SHA: ${{ github.sha }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
@@ -28,33 +33,43 @@ jobs:
             --jq '[.[] | select(.isDraft == false and .isPrerelease == false)
               | .tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | .[0] // ""')"
 
-          if [ -n "$latest_tag" ] && [ "$(git rev-list -n 1 "$latest_tag")" = "$RELEASE_SHA" ]; then
-            echo "A release already points to $RELEASE_SHA; nothing to publish."
+          if [ -n "$latest_tag" ] && git merge-base --is-ancestor "$RELEASE_SHA" "$latest_tag"; then
+            echo "This commit has already been released; nothing to publish."
             exit 0
           fi
 
-          next_tag="$(LATEST_TAG="$latest_tag" python - <<'PY'
+          export LATEST_TAG="$latest_tag"
+          export NOTES_FILE="$RUNNER_TEMP/harbor-release-notes.md"
+          next_tag="$(python - <<'PY'
           import os
+          from pathlib import Path
+          import subprocess
 
           latest = os.environ["LATEST_TAG"]
-          if not latest:
-              print("v0.1.0")
-              raise SystemExit
+          sha = os.environ["RELEASE_SHA"]
+          if latest:
+              major, minor, patch = (int(part) for part in latest[1:].split("."))
+              version = f"v{major}.{minor}.{patch + 1}"
+          else:
+              version = "v0.1.0"
 
-          major, minor, patch = (int(part) for part in latest[1:].split("."))
-          print(f"v{major}.{minor}.{patch + 1}")
+          revision = f"{latest}..{sha}" if latest else sha
+          subjects = subprocess.check_output(
+              ["git", "log", "--reverse", "--format=%s (%h)", revision],
+              encoding="utf-8",
+          ).splitlines()
+          changes = "\n".join(f"- {subject}" for subject in subjects)
+          repo_url = f"https://github.com/{os.environ['GH_REPO']}"
+          changelog = f"{repo_url}/compare/{latest}...{version}" if latest else f"{repo_url}/commits/{version}"
+          Path(os.environ["NOTES_FILE"]).write_text(
+              f"## 本次更新\n\n{changes}\n\n**完整改动**：{changelog}\n",
+              encoding="utf-8",
+          )
+          print(version)
           PY
           )"
 
-          if [ -n "$latest_tag" ]; then
-            gh release create "$next_tag" \
-              --target "$RELEASE_SHA" \
-              --title "Harbor Panel $next_tag" \
-              --generate-notes \
-              --notes-start-tag "$latest_tag"
-          else
-            gh release create "$next_tag" \
-              --target "$RELEASE_SHA" \
-              --title "Harbor Panel $next_tag" \
-              --generate-notes
-          fi
+          gh release create "$next_tag" \
+            --target "$RELEASE_SHA" \
+            --title "Harbor Panel $next_tag" \
+            --notes-file "$NOTES_FILE"

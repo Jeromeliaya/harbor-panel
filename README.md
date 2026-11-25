@@ -14,7 +14,7 @@
 
 ## 版本发布
 
-推送到 `main` 后，GitHub Actions 会自动创建一个新的 GitHub Release。首个版本为 `v0.1.0`，后续版本自动递增补丁号（例如 `v0.1.1`、`v0.1.2`）。每个 Release 使用 GitHub 的自动发布说明，列出相对上一个版本的提交和改动。
+推送到 `main` 后，GitHub Actions 会自动创建一个新的 [GitHub Release](https://github.com/Jeromeliaya/harbor-panel/releases)。首个版本为 `v0.1.0`，后续版本自动递增补丁号（例如 `v0.1.1`、`v0.1.2`）。每个 Release 自动列出相对上一个版本的提交摘要和完整改动链接，直接推送的提交也会包含在内。发布任务依次运行，重复运行已经发布的提交不会生成新版本。
 
 ## 已实现
 
